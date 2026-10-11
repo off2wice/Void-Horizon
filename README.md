@@ -1,2 +1,2 @@
 # Void-Horizon
-A space game
+A flappy space game with gravity
