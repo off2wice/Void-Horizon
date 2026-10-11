@@ -1,0 +1,4098 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>VOID HORIZON</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: #05060e;
+    touch-action: none;
+    -webkit-user-select: none; user-select: none;
+    overscroll-behavior: none;
+  }
+  /* NOTE: never 100vw/100vh — on mobile 100vh includes the browser toolbar area,
+     which stretches the canvas past the visible window and desyncs touch input.
+     fixed+inset pins the canvas to the true visible viewport. */
+  canvas { position: fixed; top: 0; left: 0; width: 100%; height: 100%; display: block; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+'use strict';
+/* ============================================================
+   VOID HORIZON — single-file HTML5 game
+   Phase 2: dual-gravity player, corridor, input semantics
+            (tap=flip instantly, FIRE key/button: tap=bolt, hold=charge), juice pack.
+   ============================================================ */
+
+// ---------- CONFIG (all tunables live here) ----------
+const CONFIG = {
+  WORLD_W: 1280,            // logical world units (letterboxed)
+  WORLD_H: 720,
+  SIM_HZ: 60,
+  SIM_DT: 1 / 60,
+  MAX_FRAME_DT: 0.25,       // clamp huge frames (tab-away) -> no spiral of death
+  BG: '#05060e',
+  NEON: '#4de8ff',
+  NEON_DIM: '#1a5f78',
+  ACCENT: '#ff4dd2',
+  WARN: '#ffd24d',
+
+  // corridor geometry (station rails)
+  RAIL_CEIL_Y: 110,         // underside of top station
+  RAIL_FLOOR_Y: 610,        // top of bottom station
+  PLAYER_X: 260,
+  PLAYER_R: 16,
+
+  // physics
+  GRAVITY: 2800,            // px/s^2
+  MAX_FALL: 1700,
+
+  // input semantics
+  CHARGE_MS: 450,           // FIRE-button hold past this = charge (release = charged shot)
+  WEAPON_UNLOCK_LEVEL: 3,   // weapon offline until Sector 3 (unlocked by clearing Sector 2)
+  TAP_S: 0.22,              // FIRE tap cooldown
+  TAP_BOLT_SPEED: 700,      // weak tap bolt (vs 900 autofire photon)
+  TAP_BOLT_DMG: 1,
+
+  // juice
+  HITSTOP_FLIP: 0.035,      // s freeze on flip
+  HITSTOP_LAND: 0.015,
+  SHAKE_FLIP: 0.30,         // trauma units
+  SHAKE_LAND: 0.12,
+  SQUASH: 0.35,             // landing squash amount
+
+  SCROLL_SPEED: 380,        // corridor scroll px/s (base; level speed multiplies)
+
+  // phase 3 — levels & obstacles
+  TOTAL_LEVELS: 50,
+  HITBOX_FACTOR: 0.8,       // forgiving: 80% of visual size
+  OBSTACLE_CAP: 24,
+  BASE_SCROLL: 380,
+  SCROLL_PER_LEVEL: 8,      // +8px/s per level (L50 = 772)
+  QUOTA_BASE: 9000,
+  QUOTA_PER_LEVEL: 700,     // L1=9.7k ... L50=44k world px (levels ~9-22s, user: too brief)
+  DUST_PER_OBSTACLE: 2,
+  DUST_GOAL_BONUS: 50,
+
+  // phase 4 — combat
+  AUTOFIRE_S: 0.42,         // photon cannon cooldown
+  BULLET_POOL: 40,
+  BULLET_SPEED: 900,
+  BULLET_DMG: 1,
+  BEAM_SPEED: 1100,         // charged beam px/s
+  BEAM_PIERCE: 3,           // obstacles a beam destroys before fading
+  BEAM_DMG: 5,
+  SHOCK_RADIUS: 150,        // pulse-lance blast radius
+
+  // playtest rework — rail hazards + combat depth
+  PULSE_WARN_S: 1.4,        // telegraph before the rail goes live (was 1.15 — too easy to miss)
+  PULSE_ACTIVE_S: 1.35,     // rail is lethal for this long
+  ENEMY_BULLET_POOL: 24,
+  ENEMY_BULLET_SPEED: 340,  // slow enough to flip-dodge
+  DRONE_SHOOT_S: 1.9,       // shooter drone fire interval
+  SPREAD_N: 8,              // void spread pellets
+  SHIELDS_START: 3,
+  HURT_IFRAMES: 1.1,        // invulnerability after taking a hit
+  DUST_PER_KILL: 2,         // unused since kills drop collectible orbs instead (see ObstacleField._destroy)
+  FIRE_BTN: { x: 1170, y: 600, r: 62 },  // on-screen FIRE (touch): lower-right thumb spot;
+                                         // rendered translucent so it never hides the boss
+  FS_BTN: { x: 1236, y: 46, r: 26 },    // fullscreen toggle, top-right corner (all states)
+  PAUSE_BTN: { x: 1172, y: 46, r: 26 }, // pause (during a run), left of fullscreen
+  // bosses (Phase 5)
+  BOSS_R: 52,               // body collision radius (forgiving via HITBOX_FACTOR)
+  BOSS_BULLET_CAP: 240,
+  BOSS_SLOMO: 0.6,          // death slow-motion time scale
+
+  STAR_LAYERS: [
+    { count: 90,  speed: 8,   size: 1.0, alpha: 0.35 },
+    { count: 55,  speed: 22,  size: 1.6, alpha: 0.60 },
+    { count: 28,  speed: 50,  size: 2.4, alpha: 0.90 },
+  ],
+};
+
+const DEBUG = new URLSearchParams(location.search).has('debug');
+
+// ---------- utils ----------
+// Task 4.3: tap-vs-hold input as a PURE state function (unit-testable).
+// Used for the FIRE channel: st = { down, t, charging } — tick() advances time,
+// decide() resolves release ('flip' label = quick tap = weak bolt, 'charged' = beam).
+// chargeEnabled=false (weapon locked or tier <2): hold NEVER latches charge.
+function tapHoldTick(st, dt, chargeMs, chargeEnabled) {
+  if (!st.down) return st;
+  st.t += dt;
+  if (!st.charging && chargeEnabled && st.t * 1000 >= chargeMs) st.charging = true;
+  return st;
+}
+function tapHoldDecide(st) {
+  // called on release ('up'). Returns 'flip' | 'charged' | 'none'.
+  if (!st.down) return 'none';
+  st.down = false;
+  const out = st.charging ? 'charged' : 'flip';
+  st.charging = false;
+  return out;
+}
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+
+// ---------- GameCanvas: dynamic scaling with DPR + letterbox ----------
+class GameCanvas {
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext('2d');
+    this.dpr = 1;
+    this.cssW = 0; this.cssH = 0;
+    this.scale = 1;
+    this.offsetX = 0; this.offsetY = 0;
+    this.resize();
+    window.addEventListener('resize', () => this.resize());
+    // mobile URL-bar collapse doesn't always fire window resize
+    if (window.visualViewport)
+      window.visualViewport.addEventListener('resize', () => this.resize());
+    window.addEventListener('orientationchange', () => this.resize());
+  }
+  resize() {
+    this.dpr = clamp(window.devicePixelRatio || 1, 1, 3);
+    this.cssW = window.innerWidth;
+    this.cssH = window.innerHeight;
+    this.canvas.width = Math.round(this.cssW * this.dpr);
+    this.canvas.height = Math.round(this.cssH * this.dpr);
+    this.scale = Math.min(this.cssW / CONFIG.WORLD_W, this.cssH / CONFIG.WORLD_H);
+    this.offsetX = (this.cssW - CONFIG.WORLD_W * this.scale) / 2;
+    this.offsetY = (this.cssH - CONFIG.WORLD_H * this.scale) / 2;
+  }
+  toWorld(clientX, clientY) {
+    // subtract the canvas's ACTUAL viewport rect (mobile URL bars can shift it;
+    // on desktop this is normally 0,0 — exact either way)
+    const r = this.canvas.getBoundingClientRect();
+    return {
+      x: (clientX - r.left - this.offsetX) / this.scale,
+      y: (clientY - r.top - this.offsetY) / this.scale,
+    };
+  }
+  beginFrame() {
+    const { ctx } = this;
+    ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    ctx.fillStyle = CONFIG.BG;
+    ctx.fillRect(0, 0, this.cssW, this.cssH);
+    ctx.save();
+    ctx.translate(this.offsetX, this.offsetY);
+    ctx.scale(this.scale, this.scale);
+    ctx.beginPath();
+    ctx.rect(0, 0, CONFIG.WORLD_W, CONFIG.WORLD_H);
+    ctx.clip();
+  }
+  endFrame() { this.ctx.restore(); }
+}
+
+// ---------- StateMachine ----------
+class StateMachine {
+  constructor(game) {
+    this.game = game;
+    this.current = null;
+    this.states = new Map();
+    this.transitions = 0;
+  }
+  register(name, state) {
+    state.name = name;
+    this.states.set(name, state);
+    return this;
+  }
+  to(name, payload) {
+    const next = this.states.get(name);
+    if (!next) throw new Error(`Unknown state: ${name}`);
+    if (this.current && this.current.onExit) this.current.onExit(this.game, name);
+    if (DEBUG) console.log(`[SM] ${this.current ? this.current.name : '(none)'} -> ${name}`);
+    this.current = next;
+    this.transitions++;
+    if (next.onEnter) next.onEnter(this.game, payload);
+  }
+  update(dt)    { if (this.current.update)    this.current.update(this.game, dt); }
+  render(rc)    { if (this.current.render)    this.current.render(this.game, rc); }
+  input(type, worldPos) { if (this.current.input) this.current.input(this.game, type, worldPos); }
+}
+
+// ---------- ART: cached glow sprites + backdrop layers (visual upgrade) ----------
+// shadowBlur is expensive and looks muddy at scale. Pre-rendered radial-gradient
+// sprites drawn with additive blending ('lighter') are far cheaper and give a
+// real bloom look. Everything here is RENDER-ONLY — no gameplay values change.
+const ART = {
+  _glow: new Map(),
+  built: false,
+  _alpha(hex, a) {
+    if (typeof hex !== 'string' || hex.length !== 7) return `rgba(255,255,255,${a})`;
+    const n = parseInt(hex.slice(1), 16);
+    return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+  },
+  _canvas(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; },
+  glowSprite(color) {
+    let c = this._glow.get(color);
+    if (c) return c;
+    c = this._canvas(128, 128);
+    const g = c.getContext('2d'), gr = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+    gr.addColorStop(0, this._alpha(color, 1));
+    gr.addColorStop(0.18, this._alpha(color, 0.65));
+    gr.addColorStop(0.5, this._alpha(color, 0.18));
+    gr.addColorStop(1, this._alpha(color, 0));
+    g.fillStyle = gr; g.fillRect(0, 0, 128, 128);
+    this._glow.set(color, c);
+    return c;
+  },
+  // additive bloom blob; r = outer radius
+  glow(ctx, x, y, r, color, alpha = 1) {
+    if (r <= 0 || alpha <= 0) return;
+    const op = ctx.globalCompositeOperation, a0 = ctx.globalAlpha;
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = a0 * Math.min(1, alpha);
+    ctx.drawImage(this.glowSprite(color), x - r, y - r, r * 2, r * 2);
+    ctx.globalCompositeOperation = op; ctx.globalAlpha = a0;
+  },
+  build() {
+    if (this.built) return;
+    this.built = true;
+    const W = CONFIG.WORLD_W, H = CONFIG.WORLD_H;
+    // --- nebula: soft overlapping clouds, tiled seamlessly on X for scrolling ---
+    {
+      const c = this._canvas(W, H), g = c.getContext('2d'), rnd = mulberry32(90210);
+      g.globalCompositeOperation = 'lighter';
+      const cols = ['#3a1a6e', '#0e4a6b', '#6b1a55', '#1a2f6e', '#0f5a5a'];
+      for (let i = 0; i < 28; i++) {
+        const x = rnd() * W, y = rnd() * H, r = 120 + rnd() * 330;
+        const col = cols[i % cols.length], a = 0.10 + rnd() * 0.12;
+        for (const ox of [-W, 0, W]) {
+          const gr = g.createRadialGradient(x + ox, y, 0, x + ox, y, r);
+          gr.addColorStop(0, this._alpha(col, a));
+          gr.addColorStop(0.6, this._alpha(col, a * 0.35));
+          gr.addColorStop(1, this._alpha(col, 0));
+          g.fillStyle = gr; g.fillRect(x + ox - r, y - r, r * 2, r * 2);
+        }
+      }
+      // baked micro-stars give the clouds texture
+      g.globalCompositeOperation = 'source-over';
+      for (let i = 0; i < 520; i++) {
+        g.globalAlpha = 0.08 + rnd() * 0.3;
+        g.fillStyle = rnd() < 0.15 ? '#ffd9f4' : '#cfeaff';
+        g.fillRect(rnd() * W, rnd() * H, 1, 1);
+      }
+      this.nebula = c;
+    }
+    // --- distant ringed gas giant ---
+    {
+      const c = this._canvas(520, 400), g = c.getContext('2d'), cx = 260, cy = 200, R = 140;
+      const ring = (front) => {
+        g.save(); g.translate(cx, cy); g.rotate(-0.28);
+        g.strokeStyle = 'rgba(255,200,120,0.32)'; g.lineWidth = 10;
+        g.beginPath(); g.ellipse(0, 0, 235, 42, 0, front ? 0 : Math.PI, front ? Math.PI : Math.PI * 2); g.stroke();
+        g.strokeStyle = 'rgba(255,170,90,0.18)'; g.lineWidth = 4;
+        g.beginPath(); g.ellipse(0, 0, 210, 36, 0, front ? 0 : Math.PI, front ? Math.PI : Math.PI * 2); g.stroke();
+        g.restore();
+      };
+      ring(false);
+      const halo = g.createRadialGradient(cx, cy, R, cx, cy, R + 40);
+      halo.addColorStop(0, 'rgba(77,232,255,0.28)'); halo.addColorStop(1, 'rgba(77,232,255,0)');
+      g.fillStyle = halo; g.fillRect(0, 0, 520, 400);
+      g.save();
+      g.beginPath(); g.arc(cx, cy, R, 0, Math.PI * 2); g.clip();
+      const body = g.createRadialGradient(cx - 50, cy - 55, 10, cx, cy, R);
+      body.addColorStop(0, '#4c78a8'); body.addColorStop(0.45, '#1d3256'); body.addColorStop(1, '#070b16');
+      g.fillStyle = body; g.fillRect(cx - R, cy - R, R * 2, R * 2);
+      const rnd = mulberry32(31337);
+      for (let i = 0; i < 9; i++) {                       // cloud bands
+        g.globalAlpha = 0.10 + rnd() * 0.14;
+        g.fillStyle = rnd() < 0.5 ? '#7fb2e0' : '#2b4f80';
+        g.beginPath();
+        g.ellipse(cx, cy - R + 20 + i * 30 + rnd() * 8, R * 1.2, 5 + rnd() * 9, -0.12, 0, Math.PI * 2);
+        g.fill();
+      }
+      g.globalAlpha = 1;
+      const shade = g.createRadialGradient(cx + 70, cy + 70, 30, cx + 70, cy + 70, R * 1.6);
+      shade.addColorStop(0, 'rgba(2,3,8,0.92)'); shade.addColorStop(0.55, 'rgba(2,3,8,0.55)');
+      shade.addColorStop(1, 'rgba(2,3,8,0)');
+      g.fillStyle = shade; g.fillRect(cx - R, cy - R, R * 2, R * 2);
+      g.restore();
+      g.strokeStyle = 'rgba(140,220,255,0.55)'; g.lineWidth = 2;
+      g.beginPath(); g.arc(cx, cy, R, Math.PI * 0.85, Math.PI * 1.7); g.stroke();
+      ring(true);
+      this.planet = c;
+    }
+    // --- vignette + hurt vignette ---
+    const vig = (inner, col, a) => {
+      const c = this._canvas(W, H), g = c.getContext('2d');
+      const gr = g.createRadialGradient(W / 2, H / 2, H * inner, W / 2, H / 2, W * 0.72);
+      gr.addColorStop(0, this._alpha(col, 0)); gr.addColorStop(1, this._alpha(col, a));
+      g.fillStyle = gr; g.fillRect(0, 0, W, H);
+      return c;
+    };
+    this.vig = vig(0.45, '#000008', 0.62);
+    this.hurt = vig(0.32, '#ff1e50', 0.55);
+  },
+};
+
+// ---------- Starfield (3-layer parallax) ----------
+class Starfield {
+  constructor(seed = 1337) {
+    const rnd = mulberry32(seed);
+    this.layers = CONFIG.STAR_LAYERS.map((cfg) => {
+      const stars = [];
+      for (let i = 0; i < cfg.count; i++) {
+        stars.push({
+          x: rnd() * CONFIG.WORLD_W,
+          y: rnd() * CONFIG.WORLD_H,
+          r: cfg.size * (0.6 + rnd() * 0.8),
+          phase: rnd() * Math.PI * 2,
+          twinkle: 0.5 + rnd() * 2.0,
+        });
+      }
+      return { cfg, stars };
+    });
+    this.time = 0;
+  }
+  update(dt, scrollMult = 1) {
+    this.time += dt;
+    this.mult = scrollMult;
+    // far layers drift with the run: nebula and planet are the slowest parallax
+    this.nebX = ((this.nebX || 0) + 3 * scrollMult * dt) % CONFIG.WORLD_W;
+    this.planetX = ((this.planetX === undefined ? 760 : this.planetX) + 1.4 * scrollMult * dt) % (CONFIG.WORLD_W + 700);
+    for (const { cfg, stars } of this.layers) {
+      for (const s of stars) {
+        s.x -= cfg.speed * scrollMult * dt;
+        if (s.x < -4) s.x += CONFIG.WORLD_W + 8;
+      }
+    }
+  }
+  render(ctx) {
+    ART.build();
+    const W = CONFIG.WORLD_W, H = CONFIG.WORLD_H;
+    // nebula clouds (seamless tile, two copies)
+    // seamless scroll as two slices (one full-screen fill instead of two)
+    const sx = Math.floor(this.nebX || 0) % W;
+    if (W - sx > 0) ctx.drawImage(ART.nebula, sx, 0, W - sx, H, 0, 0, W - sx, H);
+    if (sx > 0) ctx.drawImage(ART.nebula, 0, 0, sx, H, W - sx, 0, sx, H);
+    // distant gas giant, kept dim so it never competes with hazards
+    const px = W + 260 - (this.planetX || 0);
+    ctx.save();
+    ctx.globalAlpha = 0.24;
+    ctx.drawImage(ART.planet, px - 208, 150 - 160, 416, 320);   // high, mostly behind the ceiling
+    ctx.restore();
+    // stars: near layer stretches into streaks at speed
+    const mult = this.mult || 1;
+    this.layers.forEach(({ cfg, stars }, li) => {
+      const streak = li === 2 && mult > 1.2 ? cfg.speed * mult * 0.12 : 0;
+      for (const s of stars) {
+        const a = cfg.alpha * (0.55 + 0.45 * Math.sin(this.time * s.twinkle + s.phase));
+        ctx.globalAlpha = a;
+        if (streak > 1) {
+          ctx.strokeStyle = '#cfeaff'; ctx.lineWidth = s.r; ctx.lineCap = 'round';
+          ctx.beginPath(); ctx.moveTo(s.x, s.y); ctx.lineTo(s.x + streak, s.y); ctx.stroke();
+        } else {
+          ctx.fillStyle = '#cfeaff';
+          ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2); ctx.fill();
+        }
+        // the brightest stars get a diffraction glint
+        if (li === 2 && s.r > 2.9 && !streak) {
+          ctx.globalAlpha = a * 0.5;
+          ctx.strokeStyle = '#eaffff'; ctx.lineWidth = 0.8;
+          ctx.beginPath();
+          ctx.moveTo(s.x - 7, s.y); ctx.lineTo(s.x + 7, s.y);
+          ctx.moveTo(s.x, s.y - 7); ctx.lineTo(s.x, s.y + 7);
+          ctx.stroke();
+        }
+      }
+    });
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ---------- ParticleSystem (pooled) ----------
+class ParticleSystem {
+  constructor(max = 500) {
+    this.pool = new Array(max).fill(null).map(() => ({ alive: false }));
+    this.max = max;
+    this.aliveCount = 0;
+  }
+  spawn(x, y, vx, vy, life, color, size, opts = {}) {
+    for (let i = 0; i < this.max; i++) {
+      const p = this.pool[i];
+      if (!p.alive) {
+        p.alive = true; p.x = x; p.y = y; p.vx = vx; p.vy = vy;
+        p.life = life; p.maxLife = life; p.color = color; p.size = size;
+        p.drag = opts.drag ?? 0.985; p.glow = opts.glow ?? true;
+        this.aliveCount++;
+        return p;
+      }
+    }
+    return null; // pool exhausted — drop silently (hard cap = perf guarantee)
+  }
+  burst(x, y, n, color, speed, life = 0.5, size = 3, rnd = Math.random) {
+    for (let i = 0; i < n; i++) {
+      const a = rnd() * Math.PI * 2;
+      const sp = speed * (0.35 + rnd() * 0.65);
+      this.spawn(x, y, Math.cos(a) * sp, Math.sin(a) * sp,
+                 life * (0.6 + rnd() * 0.4), color, size * (0.6 + rnd() * 0.8));
+    }
+  }
+  update(dt) {
+    let alive = 0;
+    for (let i = 0; i < this.max; i++) {
+      const p = this.pool[i];
+      if (!p.alive) continue;
+      p.life -= dt;
+      if (p.life <= 0) { p.alive = false; continue; }
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.vx *= p.drag; p.vy *= p.drag;
+      alive++;
+    }
+    this.aliveCount = alive;
+  }
+  render(ctx) {
+    // additive bloom: overlapping sparks brighten each other like real light
+    const op = ctx.globalCompositeOperation;
+    ctx.globalCompositeOperation = 'lighter';
+    for (let i = 0; i < this.max; i++) {
+      const p = this.pool[i];
+      if (!p.alive) continue;
+      const t = p.life / p.maxLife, s = p.size * (0.5 + t * 0.5);
+      ctx.globalAlpha = t;
+      if (p.glow) ctx.drawImage(ART.glowSprite(p.color), p.x - s * 3, p.y - s * 3, s * 6, s * 6);
+      ctx.fillStyle = p.color;
+      ctx.fillRect(p.x - s * 0.5, p.y - s * 0.5, s, s);
+    }
+    ctx.globalCompositeOperation = op;
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ---------- Player: dual-gravity physics ----------
+class Player {
+  constructor(game) {
+    this.game = game;
+    this.reset();
+  }
+  reset() {
+    this.x = CONFIG.PLAYER_X;
+    this.y = CONFIG.RAIL_FLOOR_Y - CONFIG.PLAYER_R;
+    this.vy = 0;
+    this.gravDir = 1;          // 1 = falling to floor, -1 = to ceiling
+    this.grounded = true;
+    this.squash = 0;           // landing squash, decays
+    this.trail = [];           // recent positions
+    this.chargeT = 0;          // charge ring fill 0..1
+    this.alive = true;
+    this.shields = CONFIG.SHIELDS_START +
+      ((this.game.run && this.game.run.upgrades) ? this.game.run.upgrades.hull : 0);
+    this.iframes = 0;          // s of invulnerability after a hit
+  }
+  get floorY() { return CONFIG.RAIL_FLOOR_Y - CONFIG.PLAYER_R; }
+  get ceilY()  { return CONFIG.RAIL_CEIL_Y + CONFIG.PLAYER_R; }
+  // effective gravity direction*magnitude: gravDir x the Entity's distortion
+  // field (game.gravityDistort, 1.0 normally; negative = corridor pulls wrong-way)
+  eff() { return this.gravDir * (this.game.gravityDistort || 1); }
+
+  // a flip was *requested* (short tap release) — flips anytime, grounded or airborne
+  requestFlip() {
+    this.doFlip();
+  }
+  doFlip() {
+    this.gravDir *= -1;
+    this.grounded = false;
+    const g = this.game;
+    Snd.play('flip');
+    g.shake(CONFIG.SHAKE_FLIP);
+    g.hitstop = Math.max(g.hitstop, CONFIG.HITSTOP_FLIP);
+    g.particles.burst(this.x, this.y - this.gravDir * CONFIG.PLAYER_R,
+                      14, CONFIG.NEON, 420, 0.45, 3);
+    this.squash = Math.max(this.squash, 0.18); // stretch pop
+  }
+  update(dt) {
+    if (this.iframes > 0) this.iframes = Math.max(0, this.iframes - dt);
+    // Phase 6: the Entity's gravity-distortion field scales/flips effective gravity.
+    // eff < 0 means the corridor pulls the "wrong" way — flips become a tool
+    // to counter it (flip while inverted = normal pull again).
+    const eff = this.eff();
+    if (this.grounded && eff < 0) this.grounded = false;  // floor becomes ceiling-bound fall
+    if (!this.grounded) {
+      this.vy += CONFIG.GRAVITY * eff * dt;
+      this.vy = clamp(this.vy, -CONFIG.MAX_FALL, CONFIG.MAX_FALL);
+      this.y += this.vy * dt;
+      if (eff > 0 && this.y >= this.floorY) this.land(this.floorY);
+      else if (eff < 0 && this.y <= this.ceilY) this.land(this.ceilY);
+    }
+
+    this.squash = Math.max(0, this.squash - dt * 4.5);
+
+    // trail
+    this.trail.push({ x: this.x, y: this.y });
+    if (this.trail.length > 14) this.trail.shift();
+    // exhaust sparks (visual only; pooled + capped particles)
+    if (Math.random() < 0.55) {
+      const col = this.gravDir > 0 ? CONFIG.WARN : CONFIG.ACCENT;
+      this.game.particles.spawn(this.x - CONFIG.PLAYER_R * 1.35, this.y + (Math.random() - 0.5) * 6,
+        -200 - Math.random() * 180, (Math.random() - 0.5) * 50,
+        0.22 + Math.random() * 0.2, col, 1.2 + Math.random() * 1.1, { drag: 0.95 });
+    }
+  }
+  land(y) {
+    const impact = Math.abs(this.vy);
+    this.y = y;
+    this.vy = 0;
+    this.grounded = true;
+    const g = this.game;
+    if (impact > 600) { // only hard landings crunch
+      this.squash = Math.min(CONFIG.SQUASH, CONFIG.SQUASH * impact / CONFIG.MAX_FALL);
+      g.shake(CONFIG.SHAKE_LAND);
+      g.hitstop = Math.max(g.hitstop, CONFIG.HITSTOP_LAND);
+      const dir = -this.gravDir; // scuff sprays away from rail
+      for (let i = 0; i < 10; i++) {
+        g.particles.spawn(
+          this.x + (Math.random() - 0.5) * 26, this.y - dir * CONFIG.PLAYER_R,
+          (Math.random() - 0.5) * 340, dir * (60 + Math.random() * 160),
+          0.3, CONFIG.NEON_DIM, 2.2);
+      }
+    }
+  }
+  render(ctx, t) {
+    const R = CONFIG.PLAYER_R;
+    const engCol = this.gravDir > 0 ? CONFIG.WARN : CONFIG.ACCENT;
+    // ---- plasma ribbon: tapered additive streak tracing the flight path ----
+    if (this.trail.length > 2) {
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.lineCap = 'round';
+      ctx.strokeStyle = engCol;
+      const n = this.trail.length;
+      for (let i = 1; i < n; i++) {
+        const a = this.trail[i - 1], b = this.trail[i], f = i / n;
+        ctx.globalAlpha = f * 0.3;
+        ctx.lineWidth = 1.5 + f * 8;
+        ctx.beginPath();
+        ctx.moveTo(a.x - R * 1.25 - (n - i + 1) * 7, a.y);
+        ctx.lineTo(b.x - R * 1.25 - (n - i) * 7, b.y);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+    // i-frame blink: flicker hull while invulnerable after a hit
+    const blink = (this.iframes > 0 && Math.floor(t * 14) % 2 === 0) ? 0.3 : 1;
+
+    // engine bloom sits behind the hull
+    ART.glow(ctx, this.x - R * 1.3, this.y, R * (this.grounded ? 1.6 : 2.3), engCol, 0.8 * blink);
+
+    const sq = this.squash;
+    ctx.save();
+    ctx.globalAlpha = blink;
+    ctx.translate(this.x, this.y);
+    ctx.scale(1 + sq, (1 - sq) * this.gravDir);   // mirror so ship always banks toward its rail
+    ctx.rotate(clamp((this.vy * this.gravDir) / 1000, -1, 1) * 0.5);
+
+    // ---- plasma flame (layered: wide colored plume + white-hot core) ----
+    {
+      const fl = R * (0.9 + 0.3 * Math.sin(t * 40) + 0.15 * Math.sin(t * 67)) * (this.grounded ? 0.7 : 1.35);
+      const nx = -R * 1.2;
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      const outer = ctx.createLinearGradient(nx, 0, nx - fl * 1.8, 0);
+      outer.addColorStop(0, ART._alpha(engCol, 0.95)); outer.addColorStop(1, ART._alpha(engCol, 0));
+      ctx.fillStyle = outer;
+      ctx.beginPath();
+      ctx.moveTo(nx, -R * 0.24);
+      ctx.quadraticCurveTo(nx - fl * 0.9, -R * 0.3, nx - fl * 1.8, 0);
+      ctx.quadraticCurveTo(nx - fl * 0.9, R * 0.3, nx, R * 0.24);
+      ctx.closePath(); ctx.fill();
+      const core = ctx.createLinearGradient(nx, 0, nx - fl, 0);
+      core.addColorStop(0, 'rgba(255,255,255,0.95)'); core.addColorStop(1, 'rgba(255,255,255,0)');
+      ctx.fillStyle = core;
+      ctx.beginPath();
+      ctx.moveTo(nx, -R * 0.11);
+      ctx.quadraticCurveTo(nx - fl * 0.5, -R * 0.12, nx - fl, 0);
+      ctx.quadraticCurveTo(nx - fl * 0.5, R * 0.12, nx, R * 0.11);
+      ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+
+    // ---- hull: side-profile fighter, long nose, dorsal fin, swept belly wing ----
+    const hullPath = () => {
+      ctx.beginPath();
+      ctx.moveTo(R + 8, -R * 0.02);
+      ctx.lineTo(R * 0.35, -R * 0.32);
+      ctx.lineTo(-R * 0.05, -R * 0.42);
+      ctx.lineTo(-R * 0.28, -R * 0.50);
+      ctx.lineTo(-R * 0.40, -R * 1.05);
+      ctx.lineTo(-R * 0.78, -R * 0.95);
+      ctx.lineTo(-R * 0.72, -R * 0.42);
+      ctx.lineTo(-R * 0.98, -R * 0.34);
+      ctx.lineTo(-R * 1.18, -R * 0.24);
+      ctx.lineTo(-R * 1.18,  R * 0.24);
+      ctx.lineTo(-R * 0.98,  R * 0.36);
+      ctx.lineTo(-R * 0.55,  R * 0.48);
+      ctx.lineTo(-R * 0.20,  R * 1.02);
+      ctx.lineTo(-R * 0.72,  R * 0.98);
+      ctx.lineTo(-R * 0.85,  R * 0.52);
+      ctx.lineTo(-R * 0.10,  R * 0.46);
+      ctx.lineTo(R * 0.45,  R * 0.30);
+      ctx.closePath();
+    };
+    const hull = ctx.createLinearGradient(0, -R * 1.05, 0, R * 1.02);
+    hull.addColorStop(0, '#5d86b4'); hull.addColorStop(0.35, '#1f3654');
+    hull.addColorStop(0.7, '#0c1828'); hull.addColorStop(1, '#050a14');
+    ctx.fillStyle = hull;
+    ctx.shadowColor = CONFIG.NEON; ctx.shadowBlur = 10;   // one soft rim glow for the hero
+    hullPath(); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.save();
+    hullPath(); ctx.clip();
+    // panel seams + magenta racing stripe
+    ctx.strokeStyle = 'rgba(160,220,255,0.22)'; ctx.lineWidth = 0.8;
+    ctx.beginPath();
+    ctx.moveTo(R * 0.55, -R * 0.12); ctx.lineTo(-R * 1.1, -R * 0.12);
+    ctx.moveTo(-R * 0.45, -R * 0.45); ctx.lineTo(-R * 0.45, R * 0.42);
+    ctx.moveTo(-R * 0.9, -R * 0.3); ctx.lineTo(-R * 0.9, R * 0.3);
+    ctx.moveTo(-R * 0.62, R * 0.55); ctx.lineTo(-R * 0.35, R * 0.92);
+    ctx.stroke();
+    ctx.strokeStyle = ART._alpha(CONFIG.ACCENT, 0.85); ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.moveTo(R + 4, R * 0.08); ctx.lineTo(-R * 1.15, R * 0.14); ctx.stroke();
+    // engine vents
+    ctx.strokeStyle = 'rgba(77,232,255,0.45)'; ctx.lineWidth = 1;
+    for (let k = -1; k <= 1; k++) {
+      ctx.beginPath(); ctx.moveTo(-R * 1.08, k * R * 0.11); ctx.lineTo(-R * 0.96, k * R * 0.11); ctx.stroke();
+    }
+    ctx.restore();
+    // rim light
+    ctx.strokeStyle = CONFIG.NEON; ctx.lineWidth = 1.6; ctx.lineJoin = 'round';
+    hullPath(); ctx.stroke();
+
+    // ---- canopy: tinted glass with a specular streak ----
+    const glass = ctx.createRadialGradient(R * 0.02, -R * 0.56, 1, R * 0.02, -R * 0.46, R * 0.42);
+    glass.addColorStop(0, '#d8fbff'); glass.addColorStop(0.35, '#3fa6d6'); glass.addColorStop(1, '#0a2540');
+    ctx.fillStyle = glass;
+    ctx.strokeStyle = '#9ff4ff'; ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(R * 0.30, -R * 0.32);
+    ctx.quadraticCurveTo(R * 0.08, -R * 0.66, -R * 0.24, -R * 0.48);
+    ctx.lineTo(-R * 0.05, -R * 0.42);
+    ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,255,255,0.75)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(R * 0.18, -R * 0.42); ctx.quadraticCurveTo(R * 0.05, -R * 0.55, -R * 0.1, -R * 0.5); ctx.stroke();
+
+    // ---- nav lights (fin tip + wing tip) ----
+    const nav = Math.floor(t * 2.5) % 2 === 0;
+    ART.glow(ctx, -R * 0.40, -R * 1.05, 7, '#4dffb0', nav ? 0.9 : 0.25);
+    ART.glow(ctx, -R * 0.20, R * 1.02, 7, '#ff4d6d', nav ? 0.25 : 0.9);
+    ctx.restore();
+
+    // ---- shield segments: one arc per remaining shield, slowly orbiting ----
+    if (this.shields > 0) {
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      const hit = this.iframes > 0;
+      ctx.strokeStyle = hit ? CONFIG.ACCENT : CONFIG.NEON;
+      ctx.lineWidth = hit ? 3 : 1.5;
+      ctx.globalAlpha = hit ? 0.35 + 0.35 * Math.sin(t * 40) : 0.16;
+      const n = Math.min(this.shields, 8);           // never more than 8 drawn segments
+      const seg = (Math.PI * 2) / n, rot = t * 0.9;
+      for (let k = 0; k < n; k++) {
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, R * 2.05, rot + k * seg + 0.12, rot + (k + 1) * seg - 0.12);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    // ---- charge: energy gathers at the nose + ring ----
+    if (this.chargeT > 0) {
+      ART.glow(ctx, this.x + R + 10, this.y, 6 + this.chargeT * 24, CONFIG.WARN, 0.4 + this.chargeT * 0.6);
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.strokeStyle = CONFIG.WARN;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, R + 8,
+              -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * Math.min(1, this.chargeT));
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+}
+
+// ---------- Corridor (station rails + scrolling girders) ----------
+class Corridor {
+  constructor(seed = 7) {
+    this.rnd = mulberry32(seed);
+    this.girders = [];
+    for (let i = 0; i < 8; i++) {
+      this.girders.push({ x: i * 180 + this.rnd() * 60, h: 14 + this.rnd() * 26 });
+    }
+    this.lights = [];
+    for (let i = 0; i < 12; i++) {
+      this.lights.push({ x: i * 110 + this.rnd() * 40, ceil: i % 2 === 0 });
+    }
+    this.scroll = 0;
+  }
+  update(dt, speed) {
+    const v = (speed || CONFIG.SCROLL_SPEED) * dt;
+    // 15840 = common multiple of the 1440 girder and 1320 light cycles (no jump on wrap)
+    this.scroll = (this.scroll + v) % 15840;
+    this.pulseX = ((this.pulseX || 0) + v * 2.2) % 1440;
+  }
+  rail(ctx, y, flip) {
+    const W = CONFIG.WORLD_W, dir = flip ? 1 : -1;     // dir points into the corridor
+    ctx.save();
+    // energy conduit haze hugging the rail
+    const gr = ctx.createLinearGradient(0, y, 0, y + dir * 30);
+    gr.addColorStop(0, 'rgba(77,232,255,0.20)'); gr.addColorStop(1, 'rgba(77,232,255,0)');
+    ctx.fillStyle = gr;
+    ctx.fillRect(0, Math.min(y, y + dir * 30), W, 30);
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.strokeStyle = CONFIG.NEON; ctx.lineWidth = 3; ctx.globalAlpha = 0.85;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    ctx.strokeStyle = '#eaffff'; ctx.lineWidth = 1; ctx.globalAlpha = 0.9;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    ctx.globalAlpha = 1;
+    // energy pulses racing along the rail
+    for (let k = 0; k < 4; k++) {
+      const x = W + 80 - ((this.pulseX + k * 360 + (flip ? 180 : 0)) % 1440);
+      ART.glow(ctx, x, y, 34, CONFIG.NEON, 0.55);
+      ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + 70, y); ctx.stroke();
+    }
+    ctx.restore();
+    // trim line on the station side
+    ctx.strokeStyle = CONFIG.NEON_DIM; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(0, y - dir * 6); ctx.lineTo(W, y - dir * 6); ctx.stroke();
+  }
+  render(ctx, t) {
+    const W = CONFIG.WORLD_W, CY = CONFIG.RAIL_CEIL_Y, FY = CONFIG.RAIL_FLOOR_Y, H = CONFIG.WORLD_H;
+    // station masses: brushed hull plating, lit toward the corridor
+    const top = ctx.createLinearGradient(0, 0, 0, CY);
+    top.addColorStop(0, '#04060d'); top.addColorStop(0.7, '#0d1426'); top.addColorStop(1, '#1a2540');
+    ctx.fillStyle = top; ctx.fillRect(0, 0, W, CY);
+    const bot = ctx.createLinearGradient(0, FY, 0, H);
+    bot.addColorStop(0, '#1a2540'); bot.addColorStop(0.3, '#0d1426'); bot.addColorStop(1, '#04060d');
+    ctx.fillStyle = bot; ctx.fillRect(0, FY, W, H - FY);
+
+    // hull plate seams + lit portholes, scrolling with the run
+    ctx.save();
+    ctx.strokeStyle = 'rgba(120,170,220,0.10)'; ctx.lineWidth = 1;
+    const seam = this.scroll % 120;
+    ctx.beginPath();
+    for (let x = -seam; x < W; x += 120) {
+      ctx.moveTo(x, 8); ctx.lineTo(x, CY - 10);
+      ctx.moveTo(x + 60, FY + 10); ctx.lineTo(x + 60, H - 8);
+    }
+    ctx.moveTo(0, CY * 0.45); ctx.lineTo(W, CY * 0.45);
+    ctx.moveTo(0, FY + (H - FY) * 0.55); ctx.lineTo(W, FY + (H - FY) * 0.55);
+    ctx.stroke();
+    for (let i = 0; i < 18; i++) {
+      const lit = ((i * 7919) % 5) !== 0;                       // a few windows stay dark
+      const x = ((i * 83 - this.scroll * 0.9) % 1494 + 1494) % 1494 - 100;
+      const ceil = i % 2 === 0, wy = ceil ? 26 : H - 34;
+      ctx.fillStyle = lit ? 'rgba(255,214,140,0.55)' : 'rgba(80,100,130,0.25)';
+      for (let k = 0; k < 3; k++) ctx.fillRect(x + k * 12, wy, 8, 5);
+      if (lit) ART.glow(ctx, x + 14, wy + 2, 22, '#ffc85a', 0.18);
+    }
+    ctx.restore();
+
+    // scrolling girders on station faces (depth cue)
+    ctx.strokeStyle = 'rgba(77,232,255,0.20)';
+    ctx.lineWidth = 2;
+    for (const g of this.girders) {
+      const x = ((g.x - this.scroll) % 1440 + 1440) % 1440 - 80;
+      ctx.beginPath();
+      ctx.moveTo(x, CY - 4); ctx.lineTo(x + 24, CY - 4 - g.h);
+      ctx.moveTo(x, CY - 4 - g.h); ctx.lineTo(x + 48, CY - 4 - g.h);
+      ctx.moveTo(x, FY + 4); ctx.lineTo(x + 24, FY + 4 + g.h);
+      ctx.moveTo(x, FY + 4 + g.h); ctx.lineTo(x + 48, FY + 4 + g.h);
+      ctx.stroke();
+    }
+    // rail lights
+    for (const l of this.lights) {
+      const x = ((l.x - this.scroll) % 1320 + 1320) % 1320 - 40;
+      const y = l.ceil ? CY + 8 : FY - 8;
+      const pulse = 0.4 + 0.6 * Math.abs(Math.sin(t * 2 + x * 0.02));
+      ART.glow(ctx, x, y, 12, CONFIG.ACCENT, pulse);
+      ctx.fillStyle = '#ffd9f4';
+      ctx.fillRect(x - 1, y - 1, 2, 2);
+    }
+
+    this.rail(ctx, CY, true);
+    this.rail(ctx, FY, false);
+  }
+}
+
+// ---------- LevelConfig: deterministic 50-level parameter table ----------
+function LevelConfig(n) {
+  n = clamp(n, 1, CONFIG.TOTAL_LEVELS);
+  const t = (n - 1) / (CONFIG.TOTAL_LEVELS - 1);   // 0..1 progression
+  return {
+    level: n,
+    speed: CONFIG.BASE_SCROLL + CONFIG.SCROLL_PER_LEVEL * (n - 1),
+    quota: CONFIG.QUOTA_BASE + CONFIG.QUOTA_PER_LEVEL * n,
+    // spawn weights shift from debris-only toward mines/walls
+    weights: {
+      debris: 1.0,
+      mine:   Math.max(0, t * 2 - 0.2),            // mines from ~L6
+      wall:   Math.max(0, t * 1.6 - 0.2),          // walls from ~L8 (was L19)
+      drone:  Math.min(0.9, Math.max(0, t * 2)),   // drones from ~L1 ramping
+      dust:   0.55,
+    },
+    // seconds between spawns (shrinks with level; never below fair-flip window)
+    gapMin: Math.max(0.75, 1.35 - t * 0.55),
+    gapJit: Math.max(0.25, 0.9 - t * 0.5),
+    // seconds between rail pulses (whole rail electrifies — no standing still)
+    pulseGap: Math.max(1.5, 3.4 - t * 1.8),
+    pulseJit: 1.3,
+    seed: n * 7919,
+  };
+}
+
+// ---------- ObstacleField: pooled obstacles + dust, seeded per level ----------
+// Types: debris (rail chunk), mine (floats mid-corridor, pulses),
+//        wall (tall slab on one rail — forces a committed flip),
+//        dust  (collectible). All shapes are forgiving (HITBOX_FACTOR).
+class ObstacleField {
+  constructor(game, levelCfg) {
+    this.game = game;
+    this.cfg = levelCfg;
+    this.rnd = mulberry32(levelCfg.seed);
+    this.pool = new Array(CONFIG.OBSTACLE_CAP).fill(null).map(() => ({ alive: false }));
+    this.aliveCount = 0;
+    this.nextSpawnDist = 900;   // px of runway before the first obstacle
+    this.traveled = 0;
+    this.lastWallSide = 0;      // which rail the previous wall used
+    this.spawnCount = 0;
+    // rail pulses: whole rail electrifies (warn -> live -> off). Standing
+    // still = death; the only safe place is airborne or the opposite rail.
+    this.pulseEnabled = true;
+    this.pulse = { side: 0, state: 'idle', t: 0,
+                   next: levelCfg.pulseGap + this.rnd() * levelCfg.pulseJit };
+    // enemy bullets (drone tracers) — pooled like everything else
+    this.ebullets = new Array(CONFIG.ENEMY_BULLET_POOL).fill(null).map(() => ({ alive: false }));
+  }
+  _alloc() {
+    for (let i = 0; i < this.pool.length; i++) {
+      if (!this.pool[i].alive) {
+        this.pool[i].alive = true; this.aliveCount++;
+        this.pool[i].hp = undefined;   // no stale armor across reuse
+        return this.pool[i];
+      }
+    }
+    return null; // hard cap — perf guarantee
+  }
+  _pickType() {
+    const w = this.cfg.weights;
+    const total = w.debris + w.mine + w.wall + w.drone + w.dust;
+    let r = this.rnd() * total;
+    for (const k of ['debris', 'mine', 'wall', 'drone', 'dust']) {
+      if (r < w[k]) return k;
+      r -= w[k];
+    }
+    return 'debris';
+  }
+  _spawn() {
+    const g = this.game, rnd = this.rnd;
+    const type = this._pickType();
+    const onFloor = rnd() < 0.5 ? 1 : -1;   // rail the obstacle relates to
+
+    if (type === 'dust') {
+      // Dust lives in the MIDDLE of the corridor so collecting it means flipping.
+      const R = CONFIG.PLAYER_R;
+      const mkDust = (x, y) => {
+        const o = this._alloc(); if (!o) return false;
+        o.type = 'dust'; o.x = x; o.y = y; o.r = 6; o.vx = 0; o.vy = 0;
+        o.phase = rnd() * Math.PI * 2;
+        return true;
+      };
+      if (rnd() < 0.6) {
+        // FLIP ARC: orbs laid along the exact path a flip takes (gravity from rest,
+        // rail to rail), so flipping as the first orb reaches you sweeps the line.
+        const fromY = onFloor > 0 ? CONFIG.RAIL_FLOOR_Y - R : CONFIG.RAIL_CEIL_Y + R;
+        const span = (CONFIG.RAIL_FLOOR_Y - CONFIG.RAIL_CEIL_Y) - R * 2;
+        const T = Math.sqrt(2 * span / CONFIG.GRAVITY);       // time for a full flip
+        const n = 5 + Math.floor(rnd() * 2);
+        for (let i = 0; i < n; i++) {
+          const tau = T * (0.25 + 0.7 * i / (n - 1));          // skip the rail-hugging start
+          const fall = 0.5 * CONFIG.GRAVITY * tau * tau;
+          if (!mkDust(CONFIG.WORLD_W + 40 + this.cfg.speed * tau, fromY - onFloor * fall)) return;
+        }
+      } else {
+        // MID CLUSTER: a short wave floating in the centre band — grab it mid-flight
+        const mid = (CONFIG.RAIL_CEIL_Y + CONFIG.RAIL_FLOOR_Y) / 2;
+        const baseY = mid + (rnd() - 0.5) * 140;
+        const n = 3 + Math.floor(rnd() * 3), f = 0.6 + rnd() * 0.5;
+        for (let i = 0; i < n; i++)
+          if (!mkDust(CONFIG.WORLD_W + 40 + i * 34, baseY + Math.sin(i * f) * 26)) return;
+      }
+      this.spawnCount++;
+      return;
+    }
+
+    const o = this._alloc(); if (! o) return;
+    o.x = CONFIG.WORLD_W + 60;
+    o.phase = rnd() * Math.PI * 2;
+
+    if (type === 'debris') {
+      o.type = 'debris';
+      o.side = onFloor;                       // rail it sits on
+      o.w = 34 + rnd() * 26;
+      o.h = 24 + rnd() * 22;
+      o.y = onFloor > 0 ? CONFIG.RAIL_FLOOR_Y - o.h / 2 : CONFIG.RAIL_CEIL_Y + o.h / 2;
+      // jagged silhouette seeded per obstacle
+      o.jit = [rnd(), rnd(), rnd(), rnd()];
+    } else if (type === 'mine') {
+      o.type = 'mine';
+      o.r = 13 + rnd() * 4;
+      // float in the mid band — deadly while crossing, safe near rails
+      const mid = (CONFIG.RAIL_CEIL_Y + CONFIG.RAIL_FLOOR_Y) / 2;
+      o.y = mid + (rnd() - 0.5) * 130;
+    } else if (type === 'drone') {
+      // hostile. Two kinds: 'shooter' (sine-weave, fires slow tracers)
+      // and 'diver' (homes on your lane — flip to dodge).
+      o.type = 'drone';
+      o.kind = rnd() < 0.5 ? 'shooter' : 'diver';
+      o.r = 14;
+      o.hp = o.kind === 'diver' ? 1 : 3;
+      o.baseY = 200 + rnd() * 260;
+      o.y = o.baseY;
+      o.amp = 30 + rnd() * 50;
+      o.freq = 1.5 + rnd() * 1.5;
+      o.approach = o.kind === 'diver' ? 150 + rnd() * 90 : 40 + rnd() * 60;
+      o.fireT = CONFIG.DRONE_SHOOT_S * (0.6 + rnd() * 0.8);
+    } else { // wall
+      // fairness: consecutive tight walls stay on the same rail
+      let side = onFloor;
+      if (this.lastWallSide !== 0 && this.spawnGap < this.cfg.speed * 1.4) side = this.lastWallSide;
+      this.lastWallSide = side;
+      o.type = 'wall';
+      o.side = side;
+      o.w = 46 + rnd() * 40;
+      // how far it intrudes from the rail: early walls are short (gentle intro),
+      // growing to full height by ~Sector 25
+      const lvlT = (this.cfg.level - 1) / (CONFIG.TOTAL_LEVELS - 1);
+      o.reach = (180 + rnd() * 110) * (0.6 + 0.4 * Math.min(1, lvlT * 2));
+      o.y = side > 0 ? CONFIG.RAIL_FLOOR_Y - o.reach / 2 : CONFIG.RAIL_CEIL_Y + o.reach / 2;
+      o.h = o.reach;
+    }
+    this.lastType = type;
+    this.spawnCount++;
+  }
+  update(dt, speed) {
+    const dx = speed * dt;
+    this.traveled += dx;
+    this.spawnGap = (this.nextSpawnDist - this.traveled);  // runway left (px)
+
+    if (this.traveled >= this.nextSpawnDist) {
+      this.traveled = 0;
+      const c = this.cfg;
+      this.nextSpawnDist = (c.gapMin + this.rnd() * c.gapJit) * c.speed;
+      this._spawn();
+    }
+    // --- rail pulse scheduler: warn -> live -> off ---
+    const pu = this.pulse;
+    if (this.pulseEnabled) {
+      pu.t += dt;
+      if (pu.state === 'idle' && pu.t >= pu.next) {
+        pu.side = this.rnd() < 0.5 ? 1 : -1;   // which rail goes live
+        pu.state = 'warn'; pu.t = 0; pu.beepT = 0;
+        // short haptic buzz when the rail you're riding is the one charging
+        const P = this.game.player;
+        const ryP = pu.side > 0 ? CONFIG.RAIL_FLOOR_Y - CONFIG.PLAYER_R : CONFIG.RAIL_CEIL_Y + CONFIG.PLAYER_R;
+        if (P && Math.abs(P.y - ryP) < CONFIG.PLAYER_R * 1.5) {
+          try { if (navigator.vibrate) navigator.vibrate(45); } catch (e) {}
+        }
+      } else if (pu.state === 'warn' && pu.t < CONFIG.PULSE_WARN_S) {
+        // beeps speed up like a countdown: ~3/s at first, ~12/s right before it fires
+        pu.beepT -= dt;
+        if (pu.beepT <= 0) {
+          const prog = pu.t / CONFIG.PULSE_WARN_S;
+          Snd.railBeep(prog);
+          pu.beepT = 0.32 - 0.24 * prog;
+        }
+      } else if (pu.state === 'warn' && pu.t >= CONFIG.PULSE_WARN_S) {
+        pu.state = 'live'; pu.t = 0;
+        Snd.play('zap');
+        const ry = pu.side > 0 ? CONFIG.RAIL_FLOOR_Y : CONFIG.RAIL_CEIL_Y;
+        this.game.particles.burst(CONFIG.WORLD_W / 2, ry, 20, CONFIG.WARN, 300, 0.4, 2.5);
+      } else if (pu.state === 'live' && pu.t >= CONFIG.PULSE_ACTIVE_S) {
+        pu.state = 'idle'; pu.t = 0;
+        pu.next = this.cfg.pulseGap + this.rnd() * this.cfg.pulseJit;
+      }
+    }
+    let alive = 0;
+    const t = this.game.time;
+    const P = this.game.player;
+    for (const o of this.pool) {
+      if (!o.alive) continue;
+      o.x -= dx + (o.type === 'drone' ? o.approach * dt : 0);
+      if (o.type === 'dust' && (o.vx || o.vy)) {          // dropped orbs: scatter, then settle
+        o.x += o.vx * dt; o.y += o.vy * dt;
+        const damp = Math.pow(0.04, dt);                    // ~96% of drift gone after 1s
+        o.vx *= damp; o.vy *= damp;
+        if (Math.abs(o.vx) + Math.abs(o.vy) < 2) o.vx = o.vy = 0;
+        o.y = clamp(o.y, CONFIG.RAIL_CEIL_Y + 14, CONFIG.RAIL_FLOOR_Y - 14);
+      }
+      if (o.type === 'drone') {
+        if (o.kind === 'diver') {
+          // dive-bomb: home gently on the player's lane
+          const dy = clamp((P.y - o.y) * 2.2, -160, 160);
+          o.y = clamp(o.y + dy * dt, CONFIG.RAIL_CEIL_Y + 30, CONFIG.RAIL_FLOOR_Y - 30);
+        } else {
+          o.y = o.baseY + Math.sin(t * o.freq + o.phase) * o.amp;
+          // shooter: fire slow tracers at the player
+          o.fireT = (o.fireT || 0) - dt;
+          if (o.fireT <= 0 && o.x < CONFIG.WORLD_W - 40 && o.x > P.x) {
+            o.fireT = CONFIG.DRONE_SHOOT_S;
+            const eb = this.ebullets.find(b => !b.alive);
+            if (eb) {
+              const a = Math.atan2(P.y - o.y, P.x - o.x);
+              eb.alive = true; eb.x = o.x; eb.y = o.y;
+              eb.vx = Math.cos(a) * CONFIG.ENEMY_BULLET_SPEED;
+              eb.vy = Math.sin(a) * CONFIG.ENEMY_BULLET_SPEED;
+              this.game.particles.burst(o.x, o.y, 3, CONFIG.WARN, 140, 0.2, 1.6);
+            }
+          }
+        }
+      }
+      if (o.x < -160) { o.alive = false; continue; }
+      alive++;
+    }
+    // enemy bullets move + despawn (collision handled in collide())
+    for (const b of this.ebullets) {
+      if (!b.alive) continue;
+      b.x += b.vx * dt; b.y += b.vy * dt;
+      if (b.x < -20 || b.x > CONFIG.WORLD_W + 20 || b.y < 0 || b.y > CONFIG.WORLD_H) b.alive = false;
+    }
+    this.aliveCount = alive;
+  }
+  // kill an obstacle (bullet/beam/dust drop). kind: 'mine'|'debris'|'wall'|'drone'
+  _destroy(o, big) {
+    o.alive = false; this.aliveCount--;
+    const g = this.game;
+    g.particles.burst(o.x, o.y, big ? 26 : 14, o.type === 'drone' ? CONFIG.ACCENT : '#ffb347',
+                      420, 0.5, 3);
+    // every kill DROPS real dust orbs that scatter, then drift with the corridor
+    // toward you — you have to steer (flip) into them to collect.
+    const drops = (o.type === 'mine' || (o.type === 'drone' && o.kind === 'shooter')) ? 2 : 1;
+    const ox = o.x, oy = o.y;
+    for (let k = 0; k < drops; k++) {
+      const d = this._alloc(); if (!d) break;
+      const a = Math.random() * Math.PI * 2, sp = 70 + Math.random() * 90;
+      d.type = 'dust'; d.r = 6; d.phase = Math.random() * Math.PI * 2;
+      d.x = ox; d.y = clamp(oy, CONFIG.RAIL_CEIL_Y + 20, CONFIG.RAIL_FLOOR_Y - 20);
+      d.vx = Math.cos(a) * sp; d.vy = Math.sin(a) * sp;
+    }
+    g.particles.burst(ox, oy, 5, CONFIG.WARN, 240, 0.4, 2.2);
+    g.shake(big ? 0.35 : 0.18);
+    Snd.play('boom');
+  }
+  // damage obstacles overlapping a circle; returns count destroyed.
+  // opts: { pierce } — walls absorb pierce (armored), others don't.
+  damageCircle(x, y, r, opts) {
+    let destroyed = 0;
+    for (const o of this.pool) {
+      if (!o.alive || o.type === 'dust') continue;
+      let hit = false;
+      if (o.type === 'mine' || o.type === 'drone') {
+        const dx = x - o.x, dy = y - o.y, rr = r + o.r;
+        hit = dx * dx + dy * dy < rr * rr;
+      } else {
+        const hw = o.w / 2, hh = o.h / 2;
+        const cx = clamp(x, o.x - hw, o.x + hw), cy = clamp(y, o.y - hh, o.y + hh);
+        const dx = x - cx, dy = y - cy;
+        hit = dx * dx + dy * dy < r * r;
+      }
+      if (!hit) continue;
+      // per-beam seen-set: an obstacle is engaged at most once per beam,
+      // even though the beam overlaps it across multiple frames
+      if (opts && opts.seen) {
+        if (opts.seen.has(o)) continue;
+        opts.seen.add(o);
+      }
+      // WALLS ARE INDESTRUCTIBLE: every shot (bolt, beam, spread pellet) stops dead
+      // against a bulkhead in a burst of sparks. Flip around them — never through.
+      if (o.type === 'wall') {
+        if (opts && opts.pierce !== undefined) { opts.pierce = 0; opts.blocked = true; }
+        this.game.particles.burst(x, y, opts && opts.bolt ? 6 : 14, '#8fd8ff', 300, 0.3, 2);
+        continue;
+      }
+      if (opts && opts.pierce !== undefined) {
+        if (opts.pierce <= 0) continue;
+        opts.pierce--;
+      }
+      if (o.hp !== undefined) { o.hp -= (opts && opts.dmg) || 1; if (o.hp > 0) continue; }
+      this._destroy(o, o.type === 'wall');
+      destroyed++;
+    }
+    return destroyed;
+  }
+  // shockwave (pulse lance variant): destroys everything within radius, no pierce cost
+  damageRadius(x, y, radius) {
+    let destroyed = 0;
+    for (const o of this.pool) {
+      if (!o.alive || o.type === 'dust' || o.type === 'wall') continue;   // shockwaves can't breach walls
+      const dx = x - o.x, dy = y - o.y, rr = radius + (o.r || Math.max(o.w, o.h) / 2);
+      if (dx * dx + dy * dy < rr * rr) { this._destroy(o, true); destroyed++; }
+    }
+    return destroyed;
+  }
+  // returns 'hit' | 'dust' | null for this frame (player circle)
+  collide(px, py, pr, dt) {
+    let dustHit = false;
+    this.dustCount = 0;   // orbs grabbed THIS frame (several can land at once, esp. with magnet)
+    const f = CONFIG.HITBOX_FACTOR;
+    for (const o of this.pool) {
+      if (!o.alive) continue;
+      if (o.type === 'dust') {
+        const magT = (this.game.run && this.game.run.upgrades) ? this.game.run.upgrades.magnet : 0;
+        const pull = MAGNET_PULL[magT];
+        // magnet tiers drift nearby dust toward the ship (no cap on pickup radius)
+        if (pull > 0) {
+          const mdx = px - o.x, mdy = py - o.y, md2 = mdx * mdx + mdy * mdy;
+          if (md2 < (pull + 60) * (pull + 60) && md2 > 1) {
+            const md = Math.sqrt(md2);
+            const k = 320 * (1 - md / (pull + 60)) * (dt || 1/60);
+            o.x += (mdx / md) * k;
+            o.y += (mdy / md) * k;
+          }
+        }
+        const dx = px - o.x, dy = py - o.y, rr = pr + o.r + 6; // generous pickup
+        if (dx * dx + dy * dy < rr * rr) {
+          o.alive = false; this.aliveCount--;
+          dustHit = true; this.dustCount++;
+        }
+      } else if (o.type === 'mine' || o.type === 'drone') {
+        const dx = px - o.x, dy = py - o.y, rr = (pr + o.r) * f;
+        if (dx * dx + dy * dy < rr * rr) return 'hit';
+      } else { // debris & wall: circle vs AABB (forgiving size)
+        const hw = o.w / 2 * f, hh = o.h / 2 * f;
+        const cx = clamp(px, o.x - hw, o.x + hw);
+        const cy = clamp(py, o.y - hh, o.y + hh);
+        const dx = px - cx, dy = py - cy, rr = pr * f;
+        if (dx * dx + dy * dy < rr * rr) return 'hit';
+      }
+    }
+    // enemy tracers
+    for (const b of this.ebullets) {
+      if (!b.alive) continue;
+      const dx = px - b.x, dy = py - b.y, rr = pr * f + 4;
+      if (dx * dx + dy * dy < rr * rr) { b.alive = false; return 'hit'; }
+    }
+    // live rail pulse: riding an electrified rail = hit (airborne is safe)
+    const pu = this.pulse;
+    if (this.pulseEnabled && pu.state === 'live') {
+      const railY = pu.side > 0 ? CONFIG.RAIL_FLOOR_Y : CONFIG.RAIL_CEIL_Y;
+      if (Math.abs(py - (pu.side > 0 ? railY - pr : railY + pr)) < pr * 0.6) return 'hit';
+    }
+    return dustHit ? 'dust' : null;
+  }
+  render(ctx, t) {
+    // rail pulse VFX: warn = blinking stripe, live = full electric rail
+    const pu = this.pulse;
+    if (this.pulseEnabled && pu.state === 'warn') this._drawRailWarn(ctx, t);
+    if (this.pulseEnabled && pu.state === 'live') {
+      const ry = pu.side > 0 ? CONFIG.RAIL_FLOOR_Y : CONFIG.RAIL_CEIL_Y;
+      const live = pu.state === 'live';
+      const blink = live ? 1 : (Math.floor(t * 10) % 2 ? 0.8 : 0.15);
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      const zz = live ? 7 : 2;   // lightning zigzag amplitude
+      const bolt = () => {
+        ctx.beginPath();
+        for (let x = 0; x <= CONFIG.WORLD_W; x += 24) {
+          const y = ry + ((x / 24) % 2 ? -zz : zz) * (live ? (0.6 + 0.4 * Math.sin(t * 30 + x)) : 0.5);
+          if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      };
+      ctx.strokeStyle = CONFIG.WARN;
+      ctx.globalAlpha = blink * 0.35; ctx.lineWidth = live ? 14 : 5; bolt();
+      ctx.globalAlpha = blink; ctx.lineWidth = live ? 4 : 2; bolt();
+      if (live) {
+        ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1.2; bolt();
+        for (let x = (t * 900) % 160; x < CONFIG.WORLD_W; x += 160)
+          ART.glow(ctx, x, ry, 46, CONFIG.WARN, 0.45);
+      }
+      ctx.restore();
+    }
+    // enemy tracers: white-hot cores with additive halos
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineCap = 'round';
+    for (const b of this.ebullets) {
+      if (!b.alive) continue;
+      ctx.strokeStyle = CONFIG.WARN; ctx.globalAlpha = 0.5; ctx.lineWidth = 4;
+      ctx.beginPath(); ctx.moveTo(b.x, b.y); ctx.lineTo(b.x - b.vx * 0.045, b.y - b.vy * 0.045); ctx.stroke();
+      ctx.globalAlpha = 1;
+      ART.glow(ctx, b.x, b.y, 15, CONFIG.WARN, 0.9);
+      ctx.fillStyle = '#fff6d0';
+      ctx.beginPath(); ctx.arc(b.x, b.y, 2.6, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.restore();
+    for (const o of this.pool) {
+      if (!o.alive) continue;
+      ctx.save();
+      if (o.type === 'dust') this._drawDust(ctx, o, t);
+      else if (o.type === 'debris') this._drawDebris(ctx, o, t);
+      else if (o.type === 'mine') this._drawMine(ctx, o, t);
+      else if (o.type === 'drone') this._drawDrone(ctx, o, t);
+      else this._drawWall(ctx, o, t);
+      ctx.restore();
+    }
+  }
+  // RAIL CHARGING telegraph: the rail fills like a countdown bar, the danger glow
+  // builds, blinking + beeps accelerate toward the moment it goes live, and a
+  // FLIP! callout appears if you're riding the rail that's about to fire.
+  _drawRailWarn(ctx, t) {
+    const pu = this.pulse, W = CONFIG.WORLD_W;
+    const ry = pu.side > 0 ? CONFIG.RAIL_FLOOR_Y : CONFIG.RAIL_CEIL_Y;
+    const dir = pu.side > 0 ? -1 : 1;                       // into the corridor
+    const prog = clamp(pu.t / CONFIG.PULSE_WARN_S, 0, 1);
+    // chirp: blink rate climbs from 5Hz to ~21Hz
+    const on = Math.sin(Math.PI * 2 * (5 * pu.t + 8 * pu.t * prog)) > 0;
+    const k = on ? 1 : 0.5;
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    // danger haze rising off the rail
+    const band = ctx.createLinearGradient(0, ry, 0, ry + dir * 120);
+    band.addColorStop(0, ART._alpha(CONFIG.WARN, (0.12 + 0.38 * prog) * k));
+    band.addColorStop(1, ART._alpha(CONFIG.WARN, 0));
+    ctx.fillStyle = band;
+    ctx.fillRect(0, Math.min(ry, ry + dir * 120), W, 120);
+    // charge bar: dim full rail, bright fill sweeping left -> right
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = CONFIG.WARN; ctx.globalAlpha = 0.3; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(0, ry); ctx.lineTo(W, ry); ctx.stroke();
+    const fx = W * prog;
+    ctx.globalAlpha = 0.6 + 0.4 * k; ctx.lineWidth = 7;
+    ctx.beginPath(); ctx.moveTo(0, ry); ctx.lineTo(fx, ry); ctx.stroke();
+    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(0, ry); ctx.lineTo(fx, ry); ctx.stroke();
+    ctx.globalAlpha = 1;
+    ART.glow(ctx, fx, ry, 46 + prog * 20, CONFIG.WARN, 0.9);
+    // sparks crawling along the charged section
+    for (let i = 0; i < 7; i++) {
+      const sx = ((i * 233 + pu.t * 700 * (i % 2 ? 1 : -1)) % W + W) % W;
+      if (sx > fx + 40) continue;
+      ART.glow(ctx, sx, ry + Math.sin(t * 40 + i) * 4, 10 + prog * 14, CONFIG.WARN, (0.3 + 0.6 * prog) * k);
+    }
+    ctx.restore();
+    // label
+    ctx.save();
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.globalAlpha = on ? 1 : 0.45;
+    ctx.fillStyle = CONFIG.WARN;
+    ctx.font = '700 22px "Segoe UI", system-ui, sans-serif';
+    ctx.fillText('⚠  RAIL CHARGING  ⚠', W / 2, ry + dir * 40);
+    // you're on it: big FLIP! callout pointing at the safe rail
+    const P = this.game.player;
+    const ryP = pu.side > 0 ? CONFIG.RAIL_FLOOR_Y - CONFIG.PLAYER_R : CONFIG.RAIL_CEIL_Y + CONFIG.PLAYER_R;
+    if (P && P.alive && Math.abs(P.y - ryP) < CONFIG.PLAYER_R * 1.5) {
+      const pop = 1 + 0.15 * Math.sin(t * 24);
+      ctx.translate(P.x + 4, P.y + dir * 52);
+      ctx.scale(pop, pop);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#ffffff';
+      ctx.shadowColor = CONFIG.WARN; ctx.shadowBlur = 16;
+      ctx.font = '800 26px "Segoe UI", system-ui, sans-serif';
+      ctx.fillText((dir < 0 ? '▲' : '▼') + ' FLIP!', 0, 0);
+    }
+    ctx.restore();
+  }
+  // faceted gold crystal, spinning, with a glint
+  _drawDust(ctx, o, t) {
+    const pulse = 0.6 + 0.4 * Math.sin(t * 4 + o.phase);
+    ART.glow(ctx, o.x, o.y, o.r * 3.4, CONFIG.WARN, 0.3 + 0.25 * pulse);
+    ctx.translate(o.x, o.y);
+    ctx.rotate(Math.sin(t * 1.6 + o.phase) * 0.6);
+    const s = o.r * 1.1;
+    const faces = [['#fff3c4', 0, -1, 1, 0], ['#ffc44d', 1, 0, 0, 1],
+                   ['#b8780f', 0, 1, -1, 0], ['#ffde85', -1, 0, 0, -1]];
+    for (const [c, ax, ay, bx, by] of faces) {
+      ctx.fillStyle = c;
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(ax * s, ay * s * 1.35); ctx.lineTo(bx * s, by * s * 1.35);
+      ctx.closePath(); ctx.fill();
+    }
+    const gl = Math.sin(t * 2.3 + o.phase * 3);
+    if (gl > 0.9) {
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = (gl - 0.9) / 0.1;
+      ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(-9, -3); ctx.lineTo(9, -3); ctx.moveTo(0, -12); ctx.lineTo(0, 6); ctx.stroke();
+    }
+  }
+  // torn station plating: metal gradient, rivets, a still-glowing hot edge
+  _drawDebris(ctx, o, t) {
+    const hw = o.w / 2, hh = o.h / 2;
+    const baseY = o.y + hh * o.side, tipY = o.y - hh * o.side;
+    const path = () => {
+      ctx.beginPath();
+      ctx.moveTo(o.x - hw, baseY);
+      ctx.lineTo(o.x - hw + o.jit[0] * o.w * 0.5, tipY);
+      ctx.lineTo(o.x + hw - o.jit[1] * o.w * 0.5, tipY + o.jit[2] * 8 * o.side);
+      ctx.lineTo(o.x + hw, baseY);
+      ctx.closePath();
+    };
+    const gr = ctx.createLinearGradient(0, baseY, 0, tipY);
+    gr.addColorStop(0, '#0a0e18'); gr.addColorStop(1, '#46526e');
+    ctx.fillStyle = gr; path(); ctx.fill();
+    ctx.save(); path(); ctx.clip();
+    ctx.strokeStyle = 'rgba(170,185,210,0.22)'; ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let k = 1; k <= 2; k++) {
+      const yy = baseY - o.side * o.h * k * 0.3;
+      ctx.moveTo(o.x - hw, yy); ctx.lineTo(o.x + hw, yy + o.jit[3] * 6);
+    }
+    ctx.stroke();
+    ctx.fillStyle = '#6a7690';
+    for (let k = -1; k <= 1; k++) {
+      ctx.beginPath(); ctx.arc(o.x + k * hw * 0.55, baseY - o.side * 6, 1.6, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.restore();
+    ctx.strokeStyle = '#8a93a6'; ctx.lineWidth = 1.4; path(); ctx.stroke();
+    const heat = 0.5 + 0.5 * Math.sin(t * 3 + o.phase);
+    ART.glow(ctx, o.x - hw + o.jit[0] * o.w * 0.5, tipY, 9 + heat * 5, '#ff7a2a', 0.65);
+  }
+  // spiked proximity mine: dark alloy shell, pulsing core, danger halo
+  _drawMine(ctx, o, t) {
+    const pulse = 0.55 + 0.45 * Math.sin(t * 5 + o.phase);
+    ART.glow(ctx, o.x, o.y, o.r * 3.6, CONFIG.ACCENT, 0.22 + 0.3 * pulse);
+    ctx.save();
+    ctx.translate(o.x, o.y);
+    ctx.rotate(o.phase + t * 0.8);
+    ctx.fillStyle = '#3a2140'; ctx.strokeStyle = '#ff9be4'; ctx.lineWidth = 1;
+    for (let k = 0; k < 8; k++) {
+      const a = (k / 8) * Math.PI * 2;
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(a - 0.2) * o.r * 0.8, Math.sin(a - 0.2) * o.r * 0.8);
+      ctx.lineTo(Math.cos(a) * o.r * 1.6, Math.sin(a) * o.r * 1.6);
+      ctx.lineTo(Math.cos(a + 0.2) * o.r * 0.8, Math.sin(a + 0.2) * o.r * 0.8);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+    }
+    const shell = ctx.createRadialGradient(-o.r * 0.35, -o.r * 0.35, 1, 0, 0, o.r);
+    shell.addColorStop(0, '#8a6a9a'); shell.addColorStop(0.5, '#2a1830'); shell.addColorStop(1, '#100814');
+    ctx.fillStyle = shell;
+    ctx.beginPath(); ctx.arc(0, 0, o.r, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = ART._alpha(CONFIG.ACCENT, 0.75); ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.strokeStyle = ART._alpha(CONFIG.ACCENT, 0.3);
+    ctx.beginPath(); ctx.arc(0, 0, o.r * 0.62, 0, Math.PI * 2); ctx.stroke();
+    ctx.restore();
+    ART.glow(ctx, o.x, o.y, o.r * (0.8 + pulse * 0.9), CONFIG.ACCENT, 0.95);
+    ctx.fillStyle = '#ffe6f8';
+    ctx.beginPath(); ctx.arc(o.x, o.y, o.r * 0.18, 0, Math.PI * 2); ctx.fill();
+  }
+  // hostile drones. diver = afterburning dart; shooter = armored gunship
+  _drawDrone(ctx, o, t) {
+    const diver = o.kind === 'diver', col = diver ? CONFIG.WARN : CONFIG.ACCENT, r = o.r;
+    // engine wash trails behind (to the right: drones fly left)
+    ART.glow(ctx, o.x + r * 1.1, o.y, r * (diver ? 2.6 : 1.7), col, diver ? 0.8 : 0.55);
+    if (diver) {
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      const len = r * (4 + Math.sin(t * 30 + o.phase));
+      const gr = ctx.createLinearGradient(o.x + r * 0.6, 0, o.x + len, 0);
+      gr.addColorStop(0, ART._alpha(col, 0.9)); gr.addColorStop(1, ART._alpha(col, 0));
+      ctx.fillStyle = gr;
+      ctx.beginPath();
+      ctx.moveTo(o.x + r * 0.6, o.y - r * 0.28); ctx.lineTo(o.x + len, o.y); ctx.lineTo(o.x + r * 0.6, o.y + r * 0.28);
+      ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+    ctx.save();
+    ctx.translate(o.x, o.y);
+    ctx.rotate(Math.PI + Math.sin(t * 6 + o.phase) * 0.15);   // nose points left, into the player
+    const hull = ctx.createLinearGradient(0, -r, 0, r);
+    hull.addColorStop(0, '#3a4468'); hull.addColorStop(0.5, '#141a30'); hull.addColorStop(1, '#05070f');
+    ctx.fillStyle = hull; ctx.strokeStyle = col; ctx.lineWidth = 1.8; ctx.lineJoin = 'round';
+    ctx.beginPath();
+    if (diver) {
+      ctx.moveTo(r * 1.4, 0);
+      ctx.lineTo(-r * 0.4, -r * 0.5);
+      ctx.lineTo(-r * 0.15, -r * 0.18);
+      ctx.lineTo(-r * 0.95, 0);
+      ctx.lineTo(-r * 0.15, r * 0.18);
+      ctx.lineTo(-r * 0.4, r * 0.5);
+    } else {
+      ctx.moveTo(r * 1.05, 0);
+      ctx.lineTo(r * 0.2, -r * 0.55);
+      ctx.lineTo(-r * 0.75, -r * 0.9);
+      ctx.lineTo(-r * 0.4, -r * 0.2);
+      ctx.lineTo(-r * 0.55, 0);
+      ctx.lineTo(-r * 0.4, r * 0.2);
+      ctx.lineTo(-r * 0.75, r * 0.9);
+      ctx.lineTo(r * 0.2, r * 0.55);
+    }
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.strokeStyle = ART._alpha(col, 0.35); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(r * 0.7, 0); ctx.lineTo(-r * 0.4, 0); ctx.stroke();
+    if (!diver) {
+      // rotating gun ring
+      ctx.save();
+      ctx.rotate(t * 3 + o.phase);
+      ctx.strokeStyle = ART._alpha(col, 0.8); ctx.lineWidth = 2;
+      for (let k = 0; k < 3; k++) {
+        ctx.beginPath(); ctx.arc(0, 0, r * 0.5, k * 2.094, k * 2.094 + 1.2); ctx.stroke();
+      }
+      ctx.restore();
+    }
+    ctx.restore();
+    // eye core
+    ART.glow(ctx, o.x - r * 0.15, o.y, 9 + Math.sin(t * 8 + o.phase) * 2, col, 0.95);
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath(); ctx.arc(o.x - r * 0.15, o.y, 2, 0, Math.PI * 2); ctx.fill();
+    if (!diver) {
+      // firing tell: muzzle charges up as the next shot approaches
+      const fa = (o.fireT || 0) / CONFIG.DRONE_SHOOT_S;
+      if (fa < 0.35) {
+        const k = 1 - fa / 0.35;
+        ART.glow(ctx, o.x - r * 1.1, o.y, 6 + k * 20, CONFIG.WARN, k);
+        ctx.globalAlpha = k; ctx.strokeStyle = CONFIG.WARN; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.arc(o.x, o.y, r + 4 + (1 - k) * 8, 0, Math.PI * 2); ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+      // armor pips
+      if (o.hp !== undefined) {
+        for (let k = 0; k < o.hp; k++) {
+          ctx.fillStyle = CONFIG.ACCENT;
+          ctx.fillRect(o.x - 7 + k * 6, o.y - r - 9, 4, 2);
+        }
+      }
+    }
+  }
+  // station bulkhead: armored plates, hazard edge, blinking warning beacons
+  _drawWall(ctx, o, t) {
+    const hw = o.w / 2, hh = o.h / 2, x0 = o.x - hw, y0 = o.y - hh;
+    const gr = ctx.createLinearGradient(x0, 0, x0 + o.w, 0);
+    gr.addColorStop(0, '#0a1020'); gr.addColorStop(0.45, '#22324f'); gr.addColorStop(1, '#070c16');
+    ctx.fillStyle = gr; ctx.fillRect(x0, y0, o.w, o.h);
+    ctx.strokeStyle = 'rgba(140,190,230,0.16)'; ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let py = y0 + 28; py < y0 + o.h - 10; py += 32) { ctx.moveTo(x0 + 4, py); ctx.lineTo(x0 + o.w - 4, py); }
+    ctx.moveTo(o.x, y0 + 4); ctx.lineTo(o.x, y0 + o.h - 4);
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(140,190,230,0.3)';
+    for (let py = y0 + 14; py < y0 + o.h - 6; py += 32) {
+      ctx.fillRect(x0 + 5, py, 2, 2); ctx.fillRect(x0 + o.w - 7, py, 2, 2);
+    }
+    ctx.strokeStyle = '#3aa8c9'; ctx.lineWidth = 2;
+    ctx.strokeRect(x0, y0, o.w, o.h);
+    // hazard stripes on the face toward the corridor
+    const fy = o.side > 0 ? y0 : y0 + o.h;
+    ctx.save();
+    ctx.beginPath(); ctx.rect(x0, fy - 4, o.w, 8); ctx.clip();
+    ctx.strokeStyle = CONFIG.WARN; ctx.globalAlpha = 0.85; ctx.lineWidth = 3;
+    for (let sx = -o.w; sx < o.w * 2; sx += 12) {
+      ctx.beginPath(); ctx.moveTo(x0 + sx, fy - 6); ctx.lineTo(x0 + sx + 10, fy + 6); ctx.stroke();
+    }
+    ctx.restore();
+    ART.glow(ctx, o.x, fy, o.w * 0.7, CONFIG.WARN, 0.18);
+    const on = Math.floor(t * 3 + o.phase) % 2 === 0, by = fy + (o.side > 0 ? 12 : -12);
+    ART.glow(ctx, x0 + 8, by, 13, '#ff3b3b', on ? 0.95 : 0.2);
+    ART.glow(ctx, x0 + o.w - 8, by, 13, '#ff3b3b', on ? 0.2 : 0.95);
+  }
+}
+
+// ---------- Weapons: autofire bullets + charged shot variants ----------
+// weapon object shape (grows into the Phase 5 upgrade tree):
+//   { tier: 1..3, variant: 'photon'|'pulse'|'void', locked: bool }
+// Whole weapon stays OFFLINE until sector >= CONFIG.WEAPON_UNLOCK_LEVEL (user choice:
+// unlock after clearing Sector 2). tier >= 2 (granted at unlock) enables hold-charge.
+class Weapon {
+  constructor(game) {
+    this.game = game;
+    // tier is DERIVED from run.upgrades[variant] (see getter below) — Phase 7 shop
+    this.variant = 'photon';
+    this.cool = 0;
+    this.locked = true;                  // sector < WEAPON_UNLOCK_LEVEL (synced in reset)
+    this.fireHold = { down: false, t: 0, charging: false }; // FIRE-button tap-vs-hold
+    this.graceT = 0;                     // release-grace window (see _fireUp)
+    this.bullets = new Array(CONFIG.BULLET_POOL).fill(null).map(() => ({ alive: false }));
+    this.beams = [];                     // charged shots (rare — small array ok)
+    this.shocks = [];                    // pulse blast VFX
+  }
+  // derived: charging (and the whole weapon) needs tier>=2 AND sector unlocked
+  get chargeEnabled() { return this.tier >= 2 && !this.locked; }
+  get tier() {
+    const ups = this.game.run && this.game.run.upgrades;
+    return ups ? (ups[this.variant] || 0) : 1;
+  }
+  set tier(v) {   // dev/test path: write through to the shop state
+    const ups = this.game.run && this.game.run.upgrades;
+    if (ups) ups[this.variant] = clamp(Math.floor(v), 0, UPGRADES[this.variant].max);
+  }
+  // damage + autofire scaling per weapon tier (T3/T4 branches)
+  get dmgMult() {
+    const ups = this.game.run && this.game.run.upgrades;
+    return TIER_DMG[ups ? (ups[this.variant] || 0) : 2];
+  }
+  _syncGate() {
+    const lvl = (this.game.run && this.game.run.level) || 1;
+    this.locked = lvl < CONFIG.WEAPON_UNLOCK_LEVEL;
+    const ups = this.game.run && this.game.run.upgrades;
+    this.variant = (ups && ups[this.game.run.equipped]) ? this.game.run.equipped : 'photon';
+  }
+  _allocBullet() {
+    for (const b of this.bullets) if (!b.alive) { b.alive = true; return b; }
+    return null;
+  }
+  fire() {                       // autofire photon bolt
+    const b = this._allocBullet();
+    if (!b) return;
+    b.x = this.game.player.x + CONFIG.PLAYER_R;
+    b.y = this.game.player.y;
+    b.vx = CONFIG.BULLET_SPEED; b.vy = 0;
+    b.r = 3.5; b.dmg = CONFIG.BULLET_DMG * this.dmgMult; b.beam = false;
+    Snd.play('pew');
+  }
+  // FIRE-button tap: weak bolt (slower + less damage than the autofire photon)
+  fireWeak() {
+    if (this.cool > 0) return;
+    const b = this._allocBullet();
+    if (!b) return;
+    b.x = this.game.player.x + CONFIG.PLAYER_R;
+    b.y = this.game.player.y;
+    b.vx = CONFIG.TAP_BOLT_SPEED; b.vy = 0;
+    b.r = 3; b.dmg = CONFIG.TAP_BOLT_DMG; b.beam = false;
+    this.cool = CONFIG.TAP_S;
+    Snd.play('pew');
+  }
+  // charged release: spawn per variant (Task 4.4), scaled by the weapon's shop tier
+  fireCharged(variant, x, y) {
+    Snd.play('beam');
+    const ups = this.game.run && this.game.run.upgrades;
+    const t = ups ? (ups[variant] || 0) : 2;
+    const dmg = CONFIG.BEAM_DMG * TIER_DMG[t];
+    if (variant === 'void') {
+      // radial burst of fast pellets
+      for (let k = 0; k < CONFIG.SPREAD_N; k++) {
+        const b = this._allocBullet(); if (!b) break;
+        const a = (k / CONFIG.SPREAD_N) * Math.PI * 2;
+        b.x = x; b.y = y;
+        b.vx = Math.cos(a) * 620; b.vy = Math.sin(a) * 620;
+        b.r = 4; b.dmg = 2 * TIER_DMG[t]; b.beam = false; b.homing = false;
+      }
+      this.game.shake(0.4);
+      this.game.particles.burst(x, y, 18, '#b47cff', 420, 0.5, 3);
+    } else {
+      // photon: piercing beam bolt | pulse: beam that detonates on impact
+      this.beams.push({
+        x, y, r: 9,
+        vx: CONFIG.BEAM_SPEED,
+        pierce: (variant === 'pulse' ? 1 : CONFIG.BEAM_PIERCE) + (t >= 4 ? 2 : 0),
+        dmg, variant, alive: true, t: 0,
+      });
+      this.game.shake(0.5);
+      this.game.hitstop = Math.max(this.game.hitstop, 0.05);
+    }
+  }
+  update(dt, field, boss) {
+    const g = this.game;
+    this.graceT = Math.max(0, this.graceT - dt);
+    // autofire ONLY while the charge ring is full (rewards holding)
+    this.cool -= dt;
+    if (this.cool <= 0 && g.player.alive && this.chargeEnabled &&
+        g.player.chargeT >= 1) {
+      this.fire();
+      const ups = g.run && g.run.upgrades;
+      this.cool = CONFIG.AUTOFIRE_S * TIER_AUTOFIRE[ups ? (ups[this.variant] || 0) : 2];
+    }
+    else if (this.cool < 0) this.cool = 0;
+    // bullets: move, hit obstacles, despawn offscreen
+    for (const b of this.bullets) {
+      if (!b.alive) continue;
+      b.x += b.vx * dt; b.y += b.vy * dt;
+      if (b.x > CONFIG.WORLD_W + 30 || b.y < -30 || b.y > CONFIG.WORLD_H + 30 || b.x < -30) { b.alive = false; continue; }
+      // a bolt is spent on its first hit (was: flew on through every enemy in its row,
+      // and re-hit 3hp drones every frame it overlapped them)
+      const hopts = { dmg: b.dmg, pierce: 1, bolt: true };
+      field.damageCircle(b.x, b.y, b.r, hopts);
+      if (hopts.pierce <= 0) { b.alive = false; continue; }
+      if (boss && b.alive && boss.hit(b.x, b.y, b.r, b.dmg, null)) b.alive = false;
+    }
+    // beams travel right, damaging along the way
+    for (let i = this.beams.length - 1; i >= 0; i--) {
+      const bm = this.beams[i];
+      bm.t += dt;
+      bm.x += bm.vx * dt;
+      bm.seen = bm.seen || new Set();
+      const opts = { pierce: bm.pierce, dmg: bm.dmg, seen: bm.seen };
+      const destroyed = field.damageCircle(bm.x, bm.y, bm.r, opts);
+      if (boss) boss.hit(bm.x, bm.y, bm.r, bm.dmg, bm.seen);
+      bm.pierce = opts.pierce;   // write back — pierce is spent, not per-frame
+      if (bm.variant === 'pulse' && (destroyed > 0 || opts.blocked)) {   // also detonates on a wall
+        // Pulse Lance: expanding shockwave on impact
+        field.damageRadius(bm.x, bm.y, CONFIG.SHOCK_RADIUS);
+        this.shocks.push({ x: bm.x, y: bm.y, r: 10, max: CONFIG.SHOCK_RADIUS, t: 0 });
+        g.shake(0.5);
+        bm.alive = false;
+      }
+      if (!bm.alive || bm.pierce <= 0 || bm.x > CONFIG.WORLD_W + 40) {
+        if (bm.variant === 'photon') g.particles.burst(bm.x, bm.y, 10, CONFIG.NEON, 300, 0.3, 2.5);
+        this.beams.splice(i, 1);
+      }
+    }
+    // shock VFX
+    for (let i = this.shocks.length - 1; i >= 0; i--) {
+      const s = this.shocks[i];
+      s.t += dt; s.r = 10 + (s.max - 10) * Math.min(1, s.t / 0.25);
+      if (s.t > 0.3) this.shocks.splice(i, 1);
+    }
+  }
+  reset() {
+    this._syncGate();
+    this.fireHold.down = false; this.fireHold.t = 0; this.fireHold.charging = false;
+    this.graceT = 0;
+    this.cool = 0;
+    for (const b of this.bullets) b.alive = false;
+    this.beams.length = 0; this.shocks.length = 0;
+  }
+  render(ctx, t) {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineCap = 'round';
+    // bolts: plasma streak + white-hot core + bloom head
+    for (const b of this.bullets) {
+      if (!b.alive) continue;
+      const sp = Math.hypot(b.vx, b.vy) || 1, ux = b.vx / sp, uy = b.vy / sp, L = 20;
+      ctx.globalAlpha = 0.5; ctx.strokeStyle = CONFIG.NEON; ctx.lineWidth = b.r * 2.2;
+      ctx.beginPath(); ctx.moveTo(b.x - ux * L, b.y - uy * L); ctx.lineTo(b.x, b.y); ctx.stroke();
+      ctx.globalAlpha = 1; ctx.strokeStyle = '#eaffff'; ctx.lineWidth = b.r * 0.8;
+      ctx.beginPath(); ctx.moveTo(b.x - ux * L * 0.7, b.y - uy * L * 0.7); ctx.lineTo(b.x, b.y); ctx.stroke();
+      ART.glow(ctx, b.x, b.y, b.r * 4.5, CONFIG.NEON, 0.75);
+    }
+    // charged beams: wide halo, colored body, white core, crackling arcs
+    for (const bm of this.beams) {
+      const col = bm.variant === 'pulse' ? CONFIG.WARN : (bm.variant === 'void' ? '#b47cff' : CONFIG.NEON);
+      // tapered tail: transparent at the back, full colour at the head
+      ctx.lineCap = 'butt';
+      const tail = ctx.createLinearGradient(bm.x - 130, 0, bm.x, 0);
+      tail.addColorStop(0, ART._alpha(col, 0)); tail.addColorStop(1, ART._alpha(col, 0.55));
+      ctx.strokeStyle = tail; ctx.lineWidth = bm.r * 2.6;
+      ctx.beginPath(); ctx.moveTo(bm.x - 130, bm.y); ctx.lineTo(bm.x + 4, bm.y); ctx.stroke();
+      ctx.lineCap = 'round';
+      ctx.strokeStyle = col; ctx.globalAlpha = 0.95; ctx.lineWidth = bm.r * 1.2;
+      ctx.beginPath(); ctx.moveTo(bm.x - 65, bm.y); ctx.lineTo(bm.x + 8, bm.y); ctx.stroke();
+      ctx.strokeStyle = '#ffffff'; ctx.lineWidth = bm.r * 0.6;
+      ctx.beginPath(); ctx.moveTo(bm.x - 45, bm.y); ctx.lineTo(bm.x + 10, bm.y); ctx.stroke();
+      ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1; ctx.globalAlpha = 0.6;
+      ctx.beginPath();
+      for (let k = 0; k < 4; k++) {      // crackling arcs riding the beam
+        const sx = bm.x - 90 + k * 22, j = Math.sin(t * 50 + k * 2.3) * bm.r * 1.1;
+        ctx.moveTo(sx, bm.y);
+        ctx.lineTo(sx + 7, bm.y + j);
+        ctx.lineTo(sx + 14, bm.y - j * 0.5);
+        ctx.lineTo(sx + 20, bm.y);
+      }
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      ART.glow(ctx, bm.x + 8, bm.y, bm.r * 5.5, col, 1);
+    }
+    // shockwaves: bright ring + filled flash
+    for (const s of this.shocks) {
+      const a = Math.max(0, 1 - s.t / 0.3);
+      ART.glow(ctx, s.x, s.y, s.r * 1.1, CONFIG.WARN, a * 0.5);
+      ctx.globalAlpha = a; ctx.strokeStyle = CONFIG.WARN; ctx.lineWidth = 5;
+      ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2); ctx.stroke();
+      ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2); ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+    ctx.restore();
+  }
+}
+
+// ---------- UI button helper ----------
+class Button {
+  constructor(label, x, y, w, h, action) {
+    this.label = label; this.x = x; this.y = y; this.w = w; this.h = h;
+    this.action = action;
+    this.hover = false; this.pressT = 0;
+  }
+  contains(p) {
+    return p.x >= this.x && p.x <= this.x + this.w &&
+           p.y >= this.y && p.y <= this.y + this.h;
+  }
+  update(dt) { this.pressT = Math.max(0, this.pressT - dt * 4); }
+  render(ctx, t) {
+    const glow = this.hover ? 18 : 8;
+    const pulse = 0.75 + 0.25 * Math.sin(t * 2.2);
+    ctx.save();
+    ctx.shadowColor = CONFIG.NEON;
+    ctx.shadowBlur = glow * pulse;
+    ctx.strokeStyle = this.hover ? CONFIG.NEON : CONFIG.NEON_DIM;
+    ctx.lineWidth = this.hover ? 2.5 : 1.5;
+    ctx.fillStyle = this.hover ? 'rgba(77,232,255,0.10)' : 'rgba(77,232,255,0.03)';
+    const s = this.pressT * 3;
+    ctx.beginPath();
+    ctx.roundRect(this.x + s, this.y + s, this.w - s * 2, this.h - s * 2, 8);
+    ctx.fill(); ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = this.hover ? '#eaffff' : CONFIG.NEON;
+    ctx.font = '600 26px "Segoe UI", system-ui, sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(this.label, this.x + this.w / 2, this.y + this.h / 2 + 1);
+    ctx.restore();
+  }
+}
+
+// ---------- Phase 7: Upgrades (shop economy) ----------
+// run.upgrades = { photon, pulse, void, magnet, hull, charge } = tier 0..4.
+// Weapon lines: tier>=1 = owned (bolt), tier>=2 = charged shot (user-facing
+// promise in every card). Tier 3/4 scale damage + autofire, T4 adds pierce.
+// Photon starts owned at T2 (keeps the Sector-3 unlock promise from Phase 4).
+const UPGRADES = {
+  photon:  { name: 'PHOTON CANNON', weapon: true, max: 4,
+    desc: 'Piercing charged beam', costs: [null, null, 400, 900] },
+  pulse:   { name: 'PULSE LANCE', weapon: true, max: 4,
+    desc: 'Charged shot detonates a shockwave', costs: [300, 550, 950, 1600] },
+  void:    { name: 'VOID SPREAD', weapon: true, max: 4,
+    desc: 'Charged shot erupts in all directions', costs: [450, 800, 1300, 2100] },
+  magnet:  { name: 'DUST MAGNET', weapon: false, max: 4,
+    desc: 'Pulls dust in from farther away', costs: [150, 300, 600, 1200] },
+  hull:    { name: 'REINFORCED HULL', weapon: false, max: 4,
+    desc: '+1 shield per tier', costs: [250, 500, 1000, 2000] },
+  charge:  { name: 'CAPACITOR', weapon: false, max: 4,
+    desc: 'Charges your shot faster', costs: [120, 240, 480, 960] },
+};
+// cost to raise `branch` from current tier to the next (null = maxed/owned)
+function upgCost(branch, curTier) {
+  const u = UPGRADES[branch];
+  return (curTier >= u.max) ? null : u.costs[curTier];
+}
+// tier effect tables (index 0 = not purchased)
+const TIER_DMG =      [1, 1, 1, 1.5, 2];
+const TIER_AUTOFIRE = [1, 1, 1, 0.8, 0.65];
+const CHARGE_MULT =   [1, 1.35, 1.7, 2.05, 2.4];
+const MAGNET_PULL =   [0, 16, 32, 48, 64];
+
+// ---------- Phase 5: Bosses ----------
+// Boss sectors: every 5th level (5, 10, ... 45). Level 50 = Entity (Phase 6).
+// A boss fight lives INSIDE the playing state: approach -> entrance card ->
+// fight (camera lock: scroll frozen, field cleared/silent) -> death slow-mo.
+function isBossLevel(n) { return n % 5 === 0 && n < CONFIG.TOTAL_LEVELS; }
+
+// Faction lore — each boss kill unlocks its entry (LORE archive renders LORE_ENTRIES).
+// The narrator is the ship's log itself, and it edits itself: some lines carry
+// ~~strikeouts~~ and ██ redactions that change between entries (unreliable narrator).
+const BOSS_IDS = [
+  { key: 'vexill',   name: "KRIXTHA, THE SWARM",        faction: 'Vexill Hive',     color: '#8cff6a', shape: 0,
+    patterns: ['radial', 'swarm'],
+    lore: 'The Vexill Hive came first: not a fleet but a blooming — billions of insectile drones grown around a breeding mind. Krix\'tha was the first gardener we killed. The garden kept growing.' },
+  { key: 'korvaati', name: "VAAL KOR-SUN",              faction: 'Kor-Vaati Legion', color: '#ff9d3c', shape: 1,
+    patterns: ['fan', 'radial'],
+    lore: 'The Kor-Vaati fight like duellists: aimed volleys, telegraphed sweeps, contempt for cover. Vaal Kor-Sun saluted our corridor run before the volley. We did not salute back.' },
+  { key: 'nethys',   name: 'THE NETHYS CHORUS',         faction: 'Nethys Choir',    color: '#6ae0ff', shape: 2,
+    patterns: ['spiral', 'fan'],
+    lore: 'The Nethys Choir sings in fire. Their spiral litanies are precise enough to engrave hull plate. We learned to read the song; Krixtha\'s death had taught them to fear silence.' },
+  { key: 'vexill2',  name: 'HIVE MOTHER OSSU',          faction: 'Vexill Hive',     color: '#b8ff3f', shape: 3,
+    patterns: ['swarm', 'spiral'],
+    lore: 'Ossu was older than the corridor we ran. Her nursery chambers drifted for a thousand years before we woke them. Every homing mote in that dark was someone\'s breakfast.' },
+  { key: 'drathis',  name: 'BASTION DR-9',              faction: 'Drathis Compact', color: '#ff5f5f', shape: 4,
+    patterns: ['laser', 'radial'],
+    lore: 'The Drathis Compact sell war by the kilogram. Bastion DR-9 was their demo unit — a sweeping-laser billboard with a gun on it. The invoice was never paid.' },
+  { key: 'korvaati2', name: 'WARLORD KAALEN-VAA',       faction: 'Kor-Vaati Legion', color: '#ffc04d', shape: 5,
+    patterns: ['fan', 'laser'],
+    lore: 'Kaalen-Vaa fused Legion volleys with Drathis laser tech — heresy, by Kor-Vaati law, and utterly effective. The Legion mourned her the way you mourn a blade that cut you.' },
+  { key: 'nethys2',  name: 'RESONANT VAEL',             faction: 'Nethys Choir',    color: '#7df0ff', shape: 6,
+    patterns: ['spiral', 'swarm'],
+    lore: 'Vael sang the choir\'s requiem over her own sinking core. Our flight-recorders still catch the harmonics three sectors out. The cats hate that frequency.' },
+  { key: 'drathis2', name: 'SIEGE ENGINE TH-0',         faction: 'Drathis Compact', color: '#ff7a4d', shape: 7,
+    patterns: ['laser', 'spiral'],
+    lore: 'TH-0 was the Compact\'s last invoice: a siege platform that paid for itself by never being allowed to lose. We returned it to sender, restocked as debris.' },
+  { key: 'umbral',   name: 'THE UMBRAL HERALD',         faction: 'Umbral Court',    color: '#b47cff', shape: 8,
+    patterns: ['radial', 'fan', 'spiral', 'laser', 'swarm'],
+    lore: 'The Herald spoke for whatever waits past the dark: all styles, no loyalty, a courier of annihilation. It carried every faction\'s fire like samples. The Black Hole at the end of the corridor is its destination, not its throne.' },
+];
+
+function BossDef(sector) {
+  const s = clamp(sector, 1, 9);
+  const id = BOSS_IDS[s - 1];
+  return {
+    sector: s, level: s * 5, ...id,
+    // capped so the Entity (380 HP, user-final) stays the beefiest enemy
+    hp: Math.min(380, 95 + (s - 1) * 42),
+    bulletSpeed: 1 + s * 0.055,        // multiplier on every pattern's speed
+    pause: Math.max(0.45, 0.95 - s * 0.055),  // breather between patterns
+    dustReward: 40 + s * 12,
+  };
+}
+
+// Pattern library (Task 5.2): radial burst, aimed fan, spiral, sweeping laser
+// wall, homing swarm — each parameterized by sector scaling.
+class Boss {
+  constructor(game, sector) {
+    const g = game;
+    this.game = g;
+    this.def = BossDef(sector);
+    this.maxHp = this.def.hp; this.hp = this.def.hp;
+    this.x = 1080; this.y = CONFIG.WORLD_H / 2;
+    this.state = 'approach';      // approach -> entrance -> fight -> dying
+    this.winState = 'level_complete';  // Entity overrides -> 'victory'
+    this.t = 0; this.flash = 0;
+    this.patternIdx = -1; this.pat = null; this.patT = 0; this.pauseT = 0.6;
+    this.laser = null;            // { mode:'warn'|'live', y0, y1, t, hit }
+    this.bullets = [];            // boss bullets (own pool — denser than drones)
+    this.quota = Math.round(game.levelCfg.quota * 0.45);  // approach length
+    g.shake(0.8);
+  }
+  // ---- firing (all speeds scale with sector) ----
+  _shoot(x, y, ang, speed, opts = {}) {
+    if (this.bullets.length >= CONFIG.BOSS_BULLET_CAP) return;
+    this.bullets.push({ x, y, vx: Math.cos(ang) * speed, vy: Math.sin(ang) * speed,
+                        r: opts.r || 5, homing: !!opts.homing, life: opts.life || 6 });
+  }
+  _radial() {
+    const d = this.def, n = 10 + d.sector * 2, sp = 150 * d.bulletSpeed;
+    const off = Math.random() * Math.PI;
+    for (let k = 0; k < n; k++) this._shoot(this.x, this.y, off + k / n * Math.PI * 2, sp);
+    this.game.shake(0.25);
+  }
+  _fan() {
+    const d = this.def, P = this.game.player;
+    const n = 3 + Math.floor(d.sector / 2), spread = 0.55;
+    const base = Math.atan2(P.y - this.y, P.x - this.x);
+    const sp = 240 * d.bulletSpeed;
+    for (let k = 0; k < n; k++)
+      this._shoot(this.x, this.y, base + (k / (n - 1) - 0.5) * spread * 2, sp);
+  }
+  _spiralShot(ang) { this._shoot(this.x, this.y, ang, 170 * this.def.bulletSpeed); }
+  _swarm() {
+    const d = this.def, n = 3 + Math.floor(d.sector / 2);
+    for (let k = 0; k < n; k++) {
+      const a = Math.PI * 0.75 + (Math.random() - 0.5);
+      this._shoot(this.x, this.y, a, 130 * d.bulletSpeed, { homing: true, r: 6.5, life: 5 });
+    }
+    this.game.shake(0.2);
+  }
+  _laser() {
+    // sweeping laser wall: starts on the player's current rail — telegraphed,
+    // then sweeps to just short of the opposite rail. Flip to the far rail = safe.
+    const P = this.game.player;
+    const y0 = P.gravDir > 0 ? CONFIG.RAIL_FLOOR_Y : CONFIG.RAIL_CEIL_Y;
+    const y1 = (P.gravDir > 0 ? CONFIG.RAIL_CEIL_Y : CONFIG.RAIL_FLOOR_Y) + (P.gravDir > 0 ? 26 : -26);
+    this.laser = { mode: 'warn', y0, y1, t: 0, dur: 0.7, sweep: 0.8 / this.def.bulletSpeed, hit: false };
+  }
+  _startPattern() {
+    const pats = this.def.patterns;
+    this.patternIdx = (this.patternIdx + 1) % pats.length;
+    const p = pats[this.patternIdx];
+    this.pat = p; this.patT = 0; this.spiralA = Math.random() * Math.PI * 2; this.fanN = 0;
+    if (p === 'radial') { this.patDur = 0.9; this._radial(); }
+    else if (p === 'fan') { this.patDur = 1.1; this._fan(); this.fanN = 1; }
+    else if (p === 'spiral') { this.patDur = 1.5; }
+    else if (p === 'laser') { this.patDur = 0.1; this._laser(); }
+    else if (p === 'swarm') { this.patDur = 0.7; this._swarm(); }
+  }
+  update(dt) {
+    const g = this.game, d = this.def;
+    this.t += dt; this.flash = Math.max(0, this.flash - dt);
+    // sweep the FULL corridor: rail centers are y=126/594 (±234 of center).
+    // This is the aim window — the boss crosses each rail line, and the sine
+    // dwells near the extremes (exactly where the player shoots from) longest.
+    this.y = CONFIG.WORLD_H / 2 + Math.sin(this.t * 0.9) * 234;
+    if (this.state === 'approach') {
+      g.scrollMult = 2.6;
+      if (g.run.dist >= this.quota) { this.state = 'entrance'; this.cardT = 0; g.shake(0.9); Snd.play('bossIn');
+        Snd.setMusicMode(this.fightMusicMode || 'boss'); }
+    } else if (this.state === 'entrance') {
+      g.scrollMult = 0.9;
+      this.cardT += dt;
+      if (this.cardT > 1.6) {
+        this.state = 'fight';
+        g.scrollMult = 0;
+        // camera lock: clear the field, silence hazards, freeze spawning
+        for (const o of this.game.field.pool)
+          if (o.alive) { o.alive = false; g.particles.burst(o.x, o.y, 6, '#8899aa', 200, 0.4, 2); }
+        g.field.aliveCount = 0;
+        g.field.pulseEnabled = false;
+        for (const b of g.field.ebullets) b.alive = false;
+      }
+    } else if (this.state === 'fight') {
+      // pattern sequencer
+      if (this.pat) {
+        this.patT += dt;
+        if (this.pat === 'spiral') {
+          this.spiralA += dt * 7.5;
+          this._spiralAcc = (this._spiralAcc || 0) + dt;
+          const iv = 0.055 / d.bulletSpeed;
+          while (this._spiralAcc > iv) { this._spiralAcc -= iv; this._spiralShot(this.spiralA); }
+        } else if (this.pat === 'fan' && this.patT > (0.5 / d.bulletSpeed) && this.fanN < 2) {
+          this._fan(); this.fanN++;
+        } else if (this.pat === 'radial' && this.patT > this.patDur / 2 && !this.radial2) {
+          this._radial(); this.radial2 = true;
+        }
+        if (this.patT > this.patDur) {
+          if (this.pat === 'radial') this.radial2 = false;
+          this.pat = null; this.pauseT = d.pause;
+        }
+      } else {
+        this.pauseT -= dt;
+        if (this.pauseT <= 0) this._startPattern();
+      }
+      // laser wall
+      if (this.laser) {
+        const L = this.laser;
+        L.t += dt;
+        if (L.mode === 'warn' && L.t > L.dur) { L.mode = 'live'; L.t = 0; g.shake(0.4); }
+        else if (L.mode === 'live') {
+          L.y = L.y0 + (L.y1 - L.y0) * Math.min(1, L.t / L.sweep);
+          if (L.t > L.sweep) this.laser = null;
+        }
+      }
+    } else if (this.state === 'dying') {
+      this.deathT -= dt;
+      if (this.deathT <= 0) {
+        g.timeScale = 1;
+        if (this.onDeathCleanup) this.onDeathCleanup(g);
+        g.sm.to(this.winState, {
+          level: g.run.level, dust: g.run.dust,
+          bonus: CONFIG.DUST_GOAL_BONUS, boss: true, bossName: d.name,
+        });
+      }
+      return;  // bullets freeze mid-explosion — the burst reads better
+    }
+    // bullets: homing steer + move + lifetime
+    const P = g.player;
+    for (let i = this.bullets.length - 1; i >= 0; i--) {
+      const b = this.bullets[i];
+      b.life -= dt;
+      if (b.homing && P.alive) {
+        const want = Math.atan2(P.y - b.y, P.x - b.x);
+        const have = Math.atan2(b.vy, b.vx);
+        let da = want - have;
+        while (da > Math.PI) da -= Math.PI * 2;
+        while (da < -Math.PI) da += Math.PI * 2;
+        const turn = Math.max(-1.8 * dt, Math.min(1.8 * dt, da));
+        const sp = Math.hypot(b.vx, b.vy);
+        b.vx = Math.cos(have + turn) * sp; b.vy = Math.sin(have + turn) * sp;
+      }
+      b.x += b.vx * dt; b.y += b.vy * dt;
+      if (b.life <= 0 || b.x < -40 || b.x > CONFIG.WORLD_W + 40 || b.y < -40 || b.y > CONFIG.WORLD_H + 40)
+        this.bullets.splice(i, 1);
+    }
+  }
+  // player collision -> 'hit' (one read per laser sweep)
+  collide(px, py, pr) {
+    if (this.state !== 'fight') return null;
+    for (const b of this.bullets) {
+      const dx = px - b.x, dy = py - b.y, rr = pr + b.r * CONFIG.HITBOX_FACTOR;
+      if (dx * dx + dy * dy < rr * rr) { b.life = 0; return 'hit'; }
+    }
+    const L = this.laser;
+    if (L && L.mode === 'live' && !L.hit) {
+      if (Math.abs(py - L.y) < pr * CONFIG.HITBOX_FACTOR + 7) { L.hit = true; return 'hit'; }
+    }
+    return null;
+  }
+  // player weapon hits (bullets + pierce-aware beams via shared `seen` set)
+  hit(x, y, r, dmg, seen) {
+    if (this.state !== 'fight') return false;
+    if (seen && seen.has('boss')) return false;
+    const dx = x - this.x, dy = y - this.y, rr = r + CONFIG.BOSS_R * 0.9;
+    if (dx * dx + dy * dy > rr * rr) return false;
+    // consumed only on ACTUAL contact (a travelling beam's seen-set must stay
+    // open while it's still in flight — it once marked 'boss' on frame 1,
+    // which made charged beams unable to ever hit the boss)
+    if (seen) seen.add('boss');
+    this.hp -= dmg; this.flash = 0.12;
+    this.game.particles.burst(x, y, 8, this.def.color, 320, 0.3, 2.4);
+    if (this.hp <= 0) this._die();
+    return true;
+  }
+  _die() {
+    const g = this.game, d = this.def;
+    this.state = 'dying'; this.deathT = 1.0;
+    Snd.play('bigBoom');
+    g.timeScale = CONFIG.BOSS_SLOMO;         // slow-mo 0.6x, ~1s
+    g.shake(1); g.hitstop = 0.08;
+    g.particles.burst(this.x, this.y, 48, d.color, 640, 0.9, 4);
+    g.particles.burst(this.x, this.y, 30, CONFIG.WARN, 520, 0.8, 3);
+    g.addDust(d.dustReward);
+    // lore unlock (persisted; LORE screen lands in Phase 7)
+    if (!g.run.lore.includes(d.key)) { g.run.lore.push(d.key); g.saveProgress(); }
+  }
+  render(ctx, t) {
+    if (this.state === 'approach') return;
+    const d = this.def, R = CONFIG.BOSS_R;
+    // laser wall: telegraph, then a blinding sweep
+    const L = this.laser;
+    if (L) {
+      const y = L.mode === 'warn' ? L.y0 : L.y;
+      const live = L.mode === 'live';
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      if (live) {
+        const W = CONFIG.WORLD_W;
+        ctx.strokeStyle = CONFIG.WARN;
+        ctx.globalAlpha = 0.25; ctx.lineWidth = 44;
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+        ctx.globalAlpha = 0.9; ctx.lineWidth = 12;
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+        ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 3; ctx.globalAlpha = 1;
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+        for (let x = (t * 1400) % 200; x < W; x += 200) ART.glow(ctx, x, y, 60, CONFIG.WARN, 0.5);
+      } else {
+        ctx.strokeStyle = d.color; ctx.lineWidth = 2;
+        ctx.globalAlpha = Math.floor(t * 12) % 2 ? 0.75 : 0.2;
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(CONFIG.WORLD_W, y); ctx.stroke();
+        ctx.setLineDash([10, 12]); ctx.globalAlpha = 0.3; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(0, L.y1); ctx.lineTo(CONFIG.WORLD_W, L.y1); ctx.stroke();
+      }
+      ctx.restore();
+    }
+    // bullets: additive orbs (cheap enough for 240 on screen)
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (const b of this.bullets) {
+      const col = b.homing ? '#ff7ad9' : d.color;
+      const rr = b.homing ? b.r + Math.sin(t * 14 + b.life * 9) * 1.5 : b.r;
+      ART.glow(ctx, b.x - b.vx * 0.02, b.y - b.vy * 0.02, rr * 2.4, col, 0.35);
+      ART.glow(ctx, b.x, b.y, rr * 3, col, 0.85);
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath(); ctx.arc(b.x, b.y, rr * 0.45, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.restore();
+    // body: aura, orbiting halo rings, gradient core, tracking eye
+    const col = this.flash > 0 ? '#ffffff' : d.color;
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    ART.glow(ctx, 0, 0, R * 3.4, d.color, 0.4 + 0.15 * Math.sin(t * 2));
+    ctx.save();
+    ctx.rotate(t * 0.5);
+    ctx.strokeStyle = ART._alpha(d.color, 0.55); ctx.lineWidth = 3;
+    for (let k = 0; k < 6; k++) {
+      ctx.beginPath(); ctx.arc(0, 0, R * 1.6, k * Math.PI / 3, k * Math.PI / 3 + 0.6); ctx.stroke();
+    }
+    ctx.rotate(-t * 1.3);
+    ctx.strokeStyle = ART._alpha(d.color, 0.3); ctx.lineWidth = 1.5;
+    for (let k = 0; k < 12; k++) {
+      ctx.beginPath(); ctx.arc(0, 0, R * 1.85, k * Math.PI / 6, k * Math.PI / 6 + 0.22); ctx.stroke();
+    }
+    ctx.restore();
+    const body = ctx.createRadialGradient(0, 0, R * 0.1, 0, 0, R * 1.25);
+    body.addColorStop(0, ART._alpha(d.color, 0.4));
+    body.addColorStop(0.45, 'rgba(16,20,38,0.96)');
+    body.addColorStop(1, 'rgba(4,6,14,0.98)');
+    ctx.strokeStyle = col; ctx.fillStyle = body; ctx.lineWidth = 3;
+    ctx.shadowColor = col; ctx.shadowBlur = 14;
+    this._shape(ctx, d.shape, t);
+    ctx.shadowBlur = 0;
+    // battle damage: cracks spread as HP drops
+    const dmg = 1 - this.hp / this.maxHp;
+    if (dmg > 0.4) {
+      ctx.strokeStyle = ART._alpha('#ffb347', 0.35 + 0.4 * dmg); ctx.lineWidth = 1.5;
+      const rnd = mulberry32(d.sector * 101);
+      ctx.beginPath();
+      for (let k = 0; k < Math.floor(dmg * 7); k++) {
+        let a = rnd() * Math.PI * 2, rr = R * 0.25;
+        ctx.moveTo(Math.cos(a) * rr, Math.sin(a) * rr);
+        for (let s = 0; s < 3; s++) {
+          a += (rnd() - 0.5) * 0.8; rr += R * 0.22;
+          ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr);
+        }
+      }
+      ctx.stroke();
+    }
+    if (d.key !== 'entity') {
+      const P = this.game.player;
+      const ea = Math.atan2(P.y - this.y, P.x - this.x);
+      const ex = Math.cos(ea) * R * 0.22, ey = Math.sin(ea) * R * 0.22;
+      ART.glow(ctx, ex, ey, R * 0.75, col, 0.95);
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath(); ctx.arc(ex, ey, R * 0.09, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.restore();
+    // entrance name card
+    if (this.state === 'entrance') {
+      const a = Math.min(1, this.cardT * 2) * Math.min(1, (1.6 - this.cardT) * 3);
+      ctx.save();
+      ctx.globalAlpha = clamp(a, 0, 1);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = col;
+      ctx.shadowColor = col; ctx.shadowBlur = 24;
+      ctx.font = '700 54px "Segoe UI", system-ui, sans-serif';
+      ctx.fillText(d.name, CONFIG.WORLD_W / 2, CONFIG.WORLD_H / 2 - 40);
+      ctx.shadowBlur = 0; ctx.fillStyle = CONFIG.NEON_DIM;
+      ctx.font = '600 22px "Segoe UI", system-ui, sans-serif';
+      ctx.fillText(`${d.faction.toUpperCase()} — SECTOR BOSS`, CONFIG.WORLD_W / 2, CONFIG.WORLD_H / 2 + 4);
+      ctx.restore();
+    }
+  }
+  _shape(ctx, s, t) {
+    const R = CONFIG.BOSS_R;
+    const spin = t * 0.6;
+    const poly = (n, r, rot) => {
+      ctx.beginPath();
+      for (let k = 0; k < n; k++) {
+        const a = rot + k / n * Math.PI * 2;
+        const x = Math.cos(a) * r, y = Math.sin(a) * r;
+        k ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+      }
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+    };
+    if (s === 0) { poly(6, R, spin); poly(3, R * 0.45, -spin * 2); }                    // hive hex
+    else if (s === 1) { poly(4, R, 0); poly(4, R * 0.55, Math.PI / 4); ctx.strokeRect(-R*0.2,-R*0.2,R*0.4,R*0.4); } // legion diamond
+    else if (s === 2) {                                                          // choir ring
+      ctx.beginPath(); ctx.arc(0, 0, R, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      for (let k = 0; k < 5; k++) { const a = spin * 2 + k / 5 * Math.PI * 2;
+        ctx.beginPath(); ctx.arc(Math.cos(a) * R * 0.62, Math.sin(a) * R * 0.62, 5, 0, Math.PI * 2); ctx.stroke(); }
+      ctx.beginPath(); ctx.arc(0, 0, R * 0.3 + Math.sin(t * 4) * 3, 0, Math.PI * 2); ctx.stroke();
+    }
+    else if (s === 3) { poly(6, R, spin); for (let k = 0; k < 6; k++) { const a = spin + k / 6 * Math.PI * 2;
+        ctx.beginPath(); ctx.arc(Math.cos(a) * R * 1.35, Math.sin(a) * R * 1.35, 6, 0, Math.PI * 2); ctx.stroke(); } } // mother + brood
+    else if (s === 4) { ctx.fillRect(-R, -R, R * 2, R * 2); ctx.strokeRect(-R, -R, R * 2, R * 2);
+      ctx.strokeRect(-R * 0.5, -R * 0.5, R, R);
+      ctx.beginPath(); ctx.moveTo(-R, 0); ctx.lineTo(R, 0); ctx.moveTo(0, -R); ctx.lineTo(0, R); ctx.stroke(); } // bastion cross
+    else if (s === 5) { poly(3, R * 1.15, 0); poly(3, R * 0.7, Math.PI); }             // warlord star
+    else if (s === 6) { poly(8, R, spin); poly(4, R * 0.5, spin + Math.PI / 4); }      // resonant octagon
+    else if (s === 7) {                                                                // siege
+      ctx.strokeRect(-R, -R * 0.7, R * 2, R * 1.4); ctx.fillRect(-R, -R * 0.7, R * 2, R * 1.4);
+      ctx.beginPath(); ctx.moveTo(-R * 1.4, 0); ctx.lineTo(-R * 0.6, -R * 0.35); ctx.lineTo(-R * 0.6, R * 0.35);
+      ctx.closePath(); ctx.stroke(); }
+    else { poly(5, R, spin); poly(5, R * 0.72, -spin * 1.6);                            // umbral herald
+      ctx.beginPath(); ctx.arc(0, 0, R * 1.3 + Math.sin(t * 3) * 4, 0, Math.PI * 2); ctx.stroke(); }
+  }
+  renderBar(ctx) {
+    if (this.state === 'approach') return;
+    const d = this.def, w = 520, x = (CONFIG.WORLD_W - w) / 2, y = 66;
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.fillStyle = d.color;
+    ctx.font = '700 18px "Segoe UI", system-ui, sans-serif';
+    ctx.fillText(d.name + ' — ' + d.faction.toUpperCase(), CONFIG.WORLD_W / 2, y - 8);
+    ctx.fillStyle = 'rgba(10,14,28,0.8)';
+    ctx.fillRect(x, y, w, 12);
+    ctx.fillStyle = d.color;
+    ctx.shadowColor = d.color; ctx.shadowBlur = 10;
+    ctx.fillRect(x, y, w * clamp(this.hp / this.maxHp, 0, 1), 12);
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = CONFIG.NEON_DIM; ctx.lineWidth = 1;
+    ctx.strokeRect(x, y, w, 12);
+    ctx.restore();
+  }
+}
+
+// ---------- Phase 6: THE BLACK HOLE ENTITY (level 50) ----------
+// Subclasses Boss: same lifecycle (approach -> entrance -> fight -> dying) and
+// bullet/laser plumbing, plus:
+//  - a gravity-distortion field (game.gravityDistort) that sinusoidally scales
+//    and periodically INVERTS the corridor's pull — you must re-time flips
+//  - phase shifts at 66% and 33% HP: pattern pool deepens, tempo tightens
+//  - screen-wide events: GRAVITY INVERSION and CORE BURST (radial from center)
+//  - horizon warp rings rendered behind it; victory routes to the VICTORY state
+const ENTITY_DEF = {
+  key: 'entity', name: 'THE BLACK HOLE ENTITY', faction: 'IT',
+  color: '#b47cff', shape: 9, sector: 10, level: 50,
+  hp: 380, bulletSpeed: 1.55, pause: 0.42, dustReward: 400,
+  patterns: ['radial', 'fan', 'spiral', 'laser', 'swarm'],
+  lore: ''  // filled by LORE_ENTRIES
+};
+
+class Entity extends Boss {
+  constructor(game) {
+    super(game, 9);
+    this.def = { ...ENTITY_DEF };
+    this.maxHp = ENTITY_DEF.hp; this.hp = ENTITY_DEF.hp;
+    this.quota = Math.round(game.levelCfg.quota * 0.4);
+    this.winState = 'victory';
+    this.fightMusicMode = 'entity';
+    this.phase = 1;               // 1 -> 2 (66%) -> 3 (33%)
+    this.eventT = 7;              // s until next screen-wide event
+    this.event = null;            // { kind:'invert'|'burst', warnT }
+    this.distortT = Math.random() * 10;
+    game.gravityDistort = 1;
+    this.onDeathCleanup = (g) => { g.gravityDistort = 1; };
+  }
+  _phaseFor(hpFrac) { return hpFrac <= 0.33 ? 3 : (hpFrac <= 0.66 ? 2 : 1); }
+  _startPattern() {
+    // deeper pool + rarer breaths as phases progress
+    const roll = Math.random();
+    const pool = this.phase === 1 ? ['radial', 'fan', 'spiral', 'laser']
+               : this.phase === 2 ? ['fan', 'spiral', 'swarm', 'laser', 'radial']
+               : ['spiral', 'swarm', 'laser', 'radial', 'fan', 'burst-spiral'];
+    const p = pool[Math.floor(roll * pool.length)];
+    this.pat = (p === 'burst-spiral') ? 'spiral' : p;
+    this.patT = 0; this.spiralA = Math.random() * Math.PI * 2; this.fanN = 0;
+    this.radial2 = false;
+    const fast = this.phase === 3 ? 0.7 : (this.phase === 2 ? 0.85 : 1);
+    if (this.pat === 'radial') { this.patDur = 0.9 * fast; this._radial(); }
+    else if (this.pat === 'fan') { this.patDur = 1.1 * fast; this._fan(); this.fanN = 1; }
+    else if (this.pat === 'spiral') { this.patDur = 1.5 * fast; }
+    else if (this.pat === 'laser') { this.patDur = 0.1; this._laser(); }
+    else if (this.pat === 'swarm') { this.patDur = 0.7 * fast; this._swarm(); }
+  }
+  // one bullet volley wider than the sector-9 baseline
+  _radial() {
+    const d = this.def, n = 14 + this.phase * 4, sp = 150 * d.bulletSpeed;
+    const off = Math.random() * Math.PI;
+    for (let k = 0; k < n; k++) this._shoot(this.x, this.y, off + k / n * Math.PI * 2, sp);
+    this.game.shake(0.3);
+  }
+  update(dt) {
+    super.update(dt);
+    if (this.state !== 'fight' || !this.game.player.alive) {
+      // outside the fight: distortion idles at normal (also covers dying)
+      this.game.gravityDistort = 1;
+      return;
+    }
+    const g = this.game;
+    // phase shift check
+    const ph = this._phaseFor(this.hp / this.maxHp);
+    if (ph !== this.phase) {
+      this.phase = ph;
+      g.shake(1); g.hitstop = 0.07;
+      this.pat = null; this.pauseT = 0.9;   // clear mid-pattern = fair
+      this.eventT = Math.min(this.eventT, 2.2);
+      g.particles.burst(this.x, this.y, 36, ENTITY_DEF.color, 560, 0.8, 3.5);
+      Snd.play('phase');
+    }
+    // ---- gravity distortion field: base sine + periodic inversion event ----
+    this.distortT += dt;
+    const base = 0.82 + 0.28 * Math.sin(this.distortT * (0.35 + this.phase * 0.12));
+    if (this.event) {
+      const E = this.event;
+      E.t += dt;
+      if (E.kind === 'invert') {
+        if (E.t < E.warnT) { g.gravityDistort = base; }         // warning: field wobbles
+        else if (E.t < E.warnT + E.dur) {
+          g.gravityDistort = -base;                              // wrong-way pull
+          if (!E.tick) { E.tick = true; g.shake(0.55); Snd.play('invert'); }
+        } else { this.event = null; g.gravityDistort = base; }
+      } else if (E.kind === 'burst') {
+        if (E.t >= E.warnT && !E.fired) { E.fired = true; this._coreBurst(); g.shake(0.8); Snd.play('bossIn'); }
+        if (E.t > E.warnT + 0.4) this.event = null;
+        g.gravityDistort = base;
+      }
+    } else {
+      g.gravityDistort = base;
+      this.eventT -= dt;
+      if (this.eventT <= 0) {
+        this.eventT = this.phase === 3 ? 6.5 : (this.phase === 2 ? 8 : 10);
+        const invert = Math.random() < 0.62;   // inversion is the signature mechanic
+        this.event = invert
+          ? { kind: 'invert', t: 0, warnT: 1.05, dur: 1.3 + this.phase * 0.25, tick: false }
+          : { kind: 'burst',  t: 0, warnT: 1.0, fired: false };
+      }
+    }
+  }
+  _coreBurst() {
+    // radial from the CORE of the corridor, not from the body
+    const cx = CONFIG.WORLD_W * 0.62, cy = CONFIG.WORLD_H / 2;
+    const n = 16 + this.phase * 6, sp = 190 * this.def.bulletSpeed;
+    const off = Math.random() * Math.PI * 2;
+    for (let k = 0; k < n; k++) this._shoot(cx, cy, off + k / n * Math.PI * 2, sp, { r: 6 });
+  }
+  render(ctx, t) {
+    // horizon warp: concentric distorted arcs behind everything (also during
+    // approach — the hole is what the corridor has been running toward)
+    const cx = CONFIG.WORLD_W * 0.62, cy = CONFIG.WORLD_H / 2;
+    ctx.save();
+    const distorting = Math.abs((this.game.gravityDistort || 1)) < 0.95 || (this.game.gravityDistort || 1) < 0;
+    for (let ring = 0; ring < 5; ring++) {
+      const rr = 70 + ring * 46 + Math.sin(t * 1.3 + ring * 1.7) * (6 + ring * 3);
+      ctx.globalAlpha = (0.16 - ring * 0.022) * (this.state === 'fight' ? 1 : 0.55);
+      ctx.strokeStyle = ENTITY_DEF.color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      for (let a = 0; a <= 64; a++) {
+        const ang = a / 64 * Math.PI * 2;
+        const wob = Math.sin(ang * 3 + t * 2.2 + ring) * (5 + ring * 2) * (distorting ? 2.2 : 1);
+        const x = cx + Math.cos(ang) * (rr + wob), y = cy + Math.sin(ang) * (rr + wob) * 0.9;
+        a ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+      }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 0.9;
+    ctx.fillStyle = '#020208';
+    ctx.shadowColor = ENTITY_DEF.color; ctx.shadowBlur = 46;
+    ctx.beginPath(); ctx.arc(cx, cy, 42 + Math.sin(t * 2) * 3, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+    // event warning banner (invert = screen tint + text; burst = flash ring)
+    if (this.event && this.state === 'fight') {
+      const E = this.event;
+      if (E.t < E.warnT) {
+        const blink = Math.floor(t * 10) % 2 ? 0.85 : 0.3;
+        ctx.save();
+        ctx.globalAlpha = blink;
+        ctx.textAlign = 'center';
+        ctx.fillStyle = E.kind === 'invert' ? '#b47cff' : CONFIG.WARN;
+        ctx.shadowColor = ctx.fillStyle; ctx.shadowBlur = 18;
+        ctx.font = '700 40px "Segoe UI", system-ui, sans-serif';
+        ctx.fillText(E.kind === 'invert' ? '⟲ GRAVITY INVERSION' : '◉ CORE BURST',
+                     CONFIG.WORLD_W / 2, 150);
+        ctx.restore();
+      }
+    }
+    // inversion field tint while gravity is wrong-way
+    if ((this.game.gravityDistort || 1) < 0 && this.state === 'fight') {
+      ctx.save();
+      ctx.globalAlpha = 0.08 + 0.03 * Math.sin(t * 9);
+      ctx.fillStyle = ENTITY_DEF.color;
+      ctx.fillRect(0, 0, CONFIG.WORLD_W, CONFIG.WORLD_H);
+      ctx.restore();
+    }
+    super.render(ctx, t);
+  }
+  _shape(ctx, s, t) {
+    // event-horizon body: black disc + accretion ring + lensing arc
+    const R = CONFIG.BOSS_R + 6;
+    ctx.beginPath(); ctx.arc(0, 0, R, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(0, 0, R * 1.45, R * (0.5 + 0.14 * Math.sin(t * 1.8)),
+                                t * 0.5, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, 0, R * 0.55 + Math.sin(t * 5) * 2, t, t + Math.PI * 1.35); ctx.stroke();
+  }
+}
+
+// ---------- Phase 8: AUDIO (pure Web Audio synth, zero assets) ----------
+// Sfx: tiny one-shot oscillator/noise recipes. Music: an ambient drone whose
+// intensity follows the game (menu calm -> patrol -> boss -> entity). Audio
+// cannot start before a user gesture (Chrome autoplay policy): everything is
+// lazy-created on the first pointerdown/keydown, and every call degrades to
+// a silent no-op if Web Audio is unavailable.
+const Snd = {
+  ac: null, master: null, sfxGain: null, musGain: null,
+  sfxVol: 0.8, musVol: 0.6, muted: false,
+  last: {},                       // rate-limit map: name -> ac time
+  mus: null,                      // { nodes..., mode, step, timer }
+  ensure() {
+    if (this.ac) return this.ac;
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      const ac = new AC();
+      this.master = ac.createGain();
+      this.sfxGain = ac.createGain();
+      this.musGain = ac.createGain();
+      this.sfxGain.connect(this.master);
+      this.musGain.connect(this.master);
+      this.master.connect(ac.destination);
+      this.ac = ac;
+      this._applyGains();
+      this._startMusic();
+    } catch (e) { this.ac = null; }
+    return this.ac;
+  },
+  // called from the first real user gesture
+  unlock() {
+    const ac = this.ensure();
+    if (ac && ac.state === 'suspended') ac.resume().catch(() => {});
+  },
+  _applyGains() {
+    if (!this.ac) return;
+    const m = this.muted ? 0 : 1;
+    this.master.gain.setTargetAtTime(0.9 * m, this.ac.currentTime, 0.05);
+    this.sfxGain.gain.setTargetAtTime(this.sfxVol, this.ac.currentTime, 0.05);
+    this.musGain.gain.setTargetAtTime(this.musVol * 0.5, this.ac.currentTime, 0.2);
+  },
+  setVolumes(sfx, mus) {
+    this.sfxVol = clamp(sfx, 0, 1); this.musVol = clamp(mus, 0, 1);
+    this._applyGains();
+  },
+  toggleMute() { this.muted = !this.muted; this._applyGains(); return this.muted; },
+  // generic one-shot helper: freq sweep env, type, dur, gain, optional noise
+  _blip(type, f0, f1, dur, gain, opts = {}) {
+    const ac = this.ac; if (!ac) return;
+    const t = ac.currentTime;
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f0, t);
+    o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t + dur);
+    g.gain.setValueAtTime(gain, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.sfxGain);
+    o.start(t); o.stop(t + dur + 0.02);
+    if (opts.detune) {
+      const o2 = ac.createOscillator(), g2 = ac.createGain();
+      o2.type = type; o2.detune.value = opts.detune;
+      o2.frequency.setValueAtTime(f0 * 1.01, t);
+      o2.frequency.exponentialRampToValueAtTime(Math.max(20, f1 * 0.99), t + dur);
+      g2.gain.setValueAtTime(gain * 0.6, t);
+      g2.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o2.connect(g2); g2.connect(this.sfxGain);
+      o2.start(t); o2.stop(t + dur + 0.02);
+    }
+  },
+  _noise(dur, gain, freq = 800, q = 0.8) {
+    const ac = this.ac; if (!ac) return;
+    const t = ac.currentTime;
+    const n = Math.floor(ac.sampleRate * dur);
+    const buf = ac.createBuffer(1, n, ac.sampleRate);
+    const ch = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) ch[i] = (Math.random() * 2 - 1) * (1 - i / n);
+    const src = ac.createBufferSource(); src.buffer = buf;
+    const flt = ac.createBiquadFilter();
+    flt.type = 'lowpass'; flt.frequency.value = freq; flt.Q.value = q;
+    const g = ac.createGain();
+    g.gain.setValueAtTime(gain, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    src.connect(flt); flt.connect(g); g.connect(this.sfxGain);
+    src.start(t);
+  },
+  // rate-limits stop an autofire stream from machine-gunning the mixer
+  _GATES: { pew: 0.06, boom: 0.05, dust: 0.07, hurt: 0.2, die: 0.5,
+            flip: 0.04, beam: 0.1, ui: 0.05, bossIn: 0.4, bigBoom: 0.3,
+            phase: 0.4, invert: 0.4, complete: 0.5, victory: 1, riser: 1, impact: 1, zap: 0.3 },
+  play(name) {
+    const ac = this.ac; if (!ac || this.muted) return;
+    const gate = this._GATES[name] || 0.03;
+    const now = ac.currentTime;
+    if (this.last[name] && now - this.last[name] < gate) return;
+    this.last[name] = now;
+    this.lastPlayed = name;
+    switch (name) {
+      case 'flip':   this._blip('triangle', 640, 180, 0.12, 0.22); this._noise(0.09, 0.10, 2400); break;
+      case 'pew':    this._blip('square', 880, 240, 0.08, 0.10); break;
+      case 'beam':   this._blip('sawtooth', 220, 1400, 0.28, 0.22, { detune: 14 }); this._noise(0.2, 0.14, 3200); break;
+      case 'boom':   this._blip('sine', 180, 40, 0.22, 0.35); this._noise(0.18, 0.22, 900); break;
+      case 'bigBoom':this._blip('sine', 110, 26, 0.7, 0.5); this._noise(0.6, 0.35, 600); this._blip('triangle', 300, 30, 0.5, 0.2); break;
+      case 'hurt':   this._blip('sawtooth', 320, 90, 0.25, 0.3, { detune: -30 }); break;
+      case 'die':    this._blip('sawtooth', 420, 40, 0.9, 0.4, { detune: 40 }); this._noise(0.8, 0.4, 1200); break;
+      case 'dust':   this._blip('sine', 1240, 1900, 0.07, 0.12); break;
+      case 'ui':     this._blip('square', 520, 660, 0.05, 0.08); break;
+      case 'bossIn': this._blip('sine', 70, 35, 1.1, 0.5); this._noise(0.9, 0.22, 300); this._blip('sawtooth', 140, 70, 0.8, 0.14); break;
+      case 'phase':  this._blip('square', 150, 520, 0.35, 0.2); this._blip('sine', 60, 120, 0.5, 0.35); break;
+      case 'invert': this._blip('sine', 900, 120, 0.6, 0.28, { detune: 60 }); this._blip('triangle', 120, 900, 0.6, 0.18); break;
+      case 'complete': ['523', '659', '784'].forEach((f, i) => {
+                         const ac2 = this.ac; const t = ac2.currentTime + i * 0.11;
+                         const o = ac2.createOscillator(), g = ac2.createGain();
+                         o.type = 'triangle'; o.frequency.value = +f;
+                         g.gain.setValueAtTime(0.16, t);
+                         g.gain.exponentialRampToValueAtTime(0.0001, t + 0.3);
+                         o.connect(g); g.connect(this.sfxGain); o.start(t); o.stop(t + 0.32);
+                       }); break;
+      case 'victory': [392, 523, 659, 784, 1046].forEach((f, i) => {
+                         const t = ac.currentTime + i * 0.16;
+                         const o = ac.createOscillator(), g = ac.createGain();
+                         o.type = 'triangle'; o.frequency.value = f;
+                         g.gain.setValueAtTime(0.18, t);
+                         g.gain.exponentialRampToValueAtTime(0.0001, t + 0.6);
+                         o.connect(g); g.connect(this.sfxGain); o.start(t); o.stop(t + 0.62);
+                       }); break;
+      case 'riser': {   // intro: filtered-noise whoosh + climbing saw, peaks right at the impact
+        const t = ac.currentTime, d = 1.85, n = Math.floor(ac.sampleRate * d);
+        const buf = ac.createBuffer(1, n, ac.sampleRate), ch = buf.getChannelData(0);
+        for (let i = 0; i < n; i++) ch[i] = Math.random() * 2 - 1;
+        const src = ac.createBufferSource(); src.buffer = buf;
+        const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 2.5;
+        f.frequency.setValueAtTime(250, t); f.frequency.exponentialRampToValueAtTime(6500, t + d);
+        const g = ac.createGain();
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(0.3, t + d * 0.95); g.gain.linearRampToValueAtTime(0, t + d);
+        src.connect(f); f.connect(g); g.connect(this.sfxGain); src.start(t);
+        const o = ac.createOscillator(), og = ac.createGain();
+        o.type = 'sawtooth';
+        o.frequency.setValueAtTime(80, t); o.frequency.exponentialRampToValueAtTime(640, t + d);
+        og.gain.setValueAtTime(0.0001, t);
+        og.gain.exponentialRampToValueAtTime(0.07, t + d * 0.95); og.gain.linearRampToValueAtTime(0, t + d);
+        o.connect(og); og.connect(this.sfxGain); o.start(t); o.stop(t + d + 0.02);
+        break;
+      }
+      case 'zap':      // rail goes live: crackle + falling electric whine
+        this._noise(0.35, 0.3, 5000);
+        this._blip('sawtooth', 1200, 90, 0.3, 0.16, { detune: 30 });
+        break;
+      case 'impact':   // title lands: sub drop + noise blast + shimmering chord
+        this._blip('sine', 95, 28, 1.3, 0.6);
+        this._noise(1.1, 0.32, 700);
+        this._blip('sawtooth', 220, 55, 0.9, 0.12, { detune: 25 });
+        [587.3, 698.5, 880].forEach((f) => this._blip('triangle', f, f * 0.99, 1.6, 0.06));
+        break;
+    }
+  },
+
+  // rail-charge warning beep: pitch and volume climb as the rail nears going live
+  railBeep(prog) {
+    if (!this.ac || this.muted) return;
+    this._blip('square', 700 + prog * 700, 650 + prog * 650, 0.06, 0.07 + prog * 0.05);
+  },
+  // ---------- adaptive soundtrack: lookahead step sequencer ----------
+  // Epic synthwave in D minor, generated live (still zero assets).
+  // 16th-note grid, one chord per bar, 4-bar loop. Layers: kick / snare / hats,
+  // filtered saw bass, detuned saw pads, square arp, brass stabs, vibrato lead.
+  // Notes are scheduled ~120ms ahead on the AudioContext clock, so timing is
+  // sample-accurate — setInterval only wakes the scheduler, never times notes.
+  // musicMode: 'off' | 'intro' (pad swell) | 'calm' (menu) | 'play' | 'boss' | 'entity'
+  MUSIC: {
+    bpm: { intro: 116, calm: 116, play: 132, boss: 144, entity: 150 },
+    // [bass root, chord triad] as MIDI notes — one chord per bar
+    prog: {
+      main:   [[38, [62, 65, 69]], [34, [58, 62, 65]], [41, [60, 65, 69]], [36, [60, 64, 67]]], // Dm Bb F C
+      boss:   [[38, [62, 65, 69]], [36, [60, 64, 67]], [34, [58, 62, 65]], [33, [57, 61, 64]]], // Dm C Bb A
+      entity: [[38, [62, 65, 69]], [34, [58, 62, 65]], [31, [55, 58, 62]], [33, [57, 61, 64]]], // Dm Bb Gm A
+    },
+    drums: {
+      calm:   { k: 'x.......x.......', s: '........x.......', h: '..x...x...x...x.' },
+      play:   { k: 'x...x...x...x...', s: '....x.......x...', h: 'x.x.x.x.x.x.x.x.' },
+      boss:   { k: 'x..x..x.x..x..x.', s: '....x.......x..x', h: 'xxxxxxxxxxxxxxxx' },
+      entity: { k: 'x.x.x..xx.x.x..x', s: '....x..x....x.xx', h: 'xxxxxxxxxxxxxxxx' },
+    },
+    bass: { calm: 'x.......x.......', play: 'x.x.x.x.x.x.x.x.',
+            boss: 'x.xxx.xxx.xxx.xx', entity: 'xxxxxxxxxxxxxxxx' },
+  },
+  _startMusic() {
+    const ac = this.ac; if (!ac || this.mus) return;
+    // music bus: a compressor glues drums + bass + pads together
+    const comp = ac.createDynamicsCompressor();
+    comp.threshold.value = -20; comp.knee.value = 8; comp.ratio.value = 4;
+    comp.attack.value = 0.004; comp.release.value = 0.18;
+    this.musGain.disconnect();
+    this.musGain.connect(comp); comp.connect(this.master);
+    const bus = ac.createGain(); bus.connect(this.musGain);
+    // dotted-8th feedback delay = cheap stadium space for pads / arps / leads
+    const send = ac.createGain(), delay = ac.createDelay(1.5), fb = ac.createGain();
+    const damp = ac.createBiquadFilter(), wet = ac.createGain();
+    damp.type = 'lowpass'; damp.frequency.value = 3000;
+    fb.gain.value = 0.32; wet.gain.value = 0.3;
+    send.connect(delay); delay.connect(damp); damp.connect(fb); fb.connect(delay);
+    damp.connect(wet); wet.connect(bus);
+    // one shared second of white noise for every drum hit
+    const n = ac.sampleRate, nb = ac.createBuffer(1, n, n), ch = nb.getChannelData(0);
+    for (let i = 0; i < n; i++) ch[i] = Math.random() * 2 - 1;
+    this.mus = { mode: 'off', step: 0, nextT: ac.currentTime + 0.1, bus, send, delay, noise: nb };
+    this.mus.timer = setInterval(() => this._schedule(), 25);
+    this.setMusicMode(this.wantMode || 'calm');
+  },
+  _schedule() {
+    const ac = this.ac, m = this.mus; if (!ac || !m) return;
+    const now = ac.currentTime;
+    if (m.mode === 'off' || this.muted || ac.state !== 'running') { m.nextT = now + 0.05; return; }
+    if (m.nextT < now - 0.1) m.nextT = now + 0.05;   // woke late (background tab): resync, no burst
+    while (m.nextT < now + 0.12) {
+      this._step(m.mode, m.step, m.nextT);
+      m.nextT += 60 / (this.MUSIC.bpm[m.mode] || 120) / 4;
+      m.step = (m.step + 1) % 64;
+    }
+  },
+  _step(mode, step, t) {
+    const M = this.MUSIC, s = step % 16, bar = step >> 4;
+    const prog = M.prog[mode === 'boss' ? 'boss' : mode === 'entity' ? 'entity' : 'main'];
+    const [root, triad] = prog[bar];
+    const spb = 60 / (M.bpm[mode] || 120), six = spb / 4;
+    const fight = mode === 'boss' || mode === 'entity';
+    if (mode === 'intro') { if (s === 0) this._pad(t, triad, spb * 4, 0.6); return; }
+    if (s === 0) {
+      this._pad(t, triad, spb * 4, mode === 'calm' ? 0.9 : 0.7);
+      if (bar === 0 && fight) this._crash(t);
+    }
+    const d = M.drums[mode];
+    if (d) {
+      if (d.k[s] === 'x') this._kick(t, mode === 'calm' ? 0.6 : 0.95);
+      if (d.s[s] === 'x') this._snare(t, mode === 'calm' ? 0.35 : 0.6);
+      if (d.h[s] === 'x') this._hat(t, s % 4 === 2 ? 0.16 : 0.08, s % 8 === 6 && mode !== 'calm');
+    }
+    const bp = M.bass[mode];
+    if (bp && bp[s] === 'x') {
+      const oct = (mode === 'play' && s % 4 === 2) ? 12 : 0;   // octave pump on the "and"
+      this._bass(t, root + oct, mode === 'calm' ? spb * 1.8 : six * 1.6);
+    }
+    // arp: chord tones climbing — 8ths on the menu, 16ths in action
+    if (mode !== 'calm' || s % 2 === 0) {
+      const seq = [0, 1, 2, 3, 2, 1, 2, 3];
+      const k = seq[(mode === 'calm' ? s / 2 : s) % 8];
+      const note = (k === 3 ? triad[0] + 12 : triad[k]) + (mode === 'entity' ? 12 : 0);
+      this._pluck(t, note, mode === 'calm' ? 0.09 : 0.06);
+    }
+    // brass stabs: syncopated chord hits in fights (and on the run's turnaround bar)
+    if ((fight || (mode === 'play' && bar === 3)) && (s === 0 || s === 3 || s === 6))
+      this._stab(t, triad, six * 2.2);
+    // soaring lead: held top note on bars 2 and 4 once the action starts
+    if (mode !== 'calm' && s === 0 && bar % 2 === 1) this._lead(t, triad[2] + 12, spb * 3.5);
+  },
+  _hz(midi) { return 440 * Math.pow(2, (midi - 69) / 12); },
+  _env(g, t, peak, a, d) {
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(peak, t + a);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + a + d);
+  },
+  _kick(t, v) {
+    const ac = this.ac, o = ac.createOscillator(), g = ac.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(160, t); o.frequency.exponentialRampToValueAtTime(42, t + 0.12);
+    this._env(g, t, 0.9 * v, 0.003, 0.32);
+    o.connect(g); g.connect(this.mus.bus); o.start(t); o.stop(t + 0.4);
+  },
+  _noiseHit(t, type, freq, q, peak, dur, send) {
+    const ac = this.ac, src = ac.createBufferSource(), f = ac.createBiquadFilter(), g = ac.createGain();
+    src.buffer = this.mus.noise;
+    f.type = type; f.frequency.value = freq; f.Q.value = q;
+    this._env(g, t, peak, 0.002, dur);
+    src.connect(f); f.connect(g); g.connect(this.mus.bus);
+    if (send) g.connect(this.mus.send);
+    src.start(t, Math.random() * 0.5); src.stop(t + dur + 0.05);
+  },
+  _snare(t, v) {
+    this._noiseHit(t, 'bandpass', 1900, 0.9, 0.55 * v, 0.16, true);
+    const ac = this.ac, o = ac.createOscillator(), g = ac.createGain();
+    o.type = 'triangle';
+    o.frequency.setValueAtTime(220, t); o.frequency.exponentialRampToValueAtTime(140, t + 0.08);
+    this._env(g, t, 0.35 * v, 0.002, 0.1);
+    o.connect(g); g.connect(this.mus.bus); o.start(t); o.stop(t + 0.15);
+  },
+  _hat(t, v, open) { this._noiseHit(t, 'highpass', 7500, 0.7, v, open ? 0.14 : 0.035, false); },
+  _crash(t) { this._noiseHit(t, 'highpass', 5000, 0.5, 0.22, 1.6, true); },
+  _bass(t, midi, dur) {
+    const ac = this.ac, fr = this._hz(midi);
+    const o = ac.createOscillator(), o2 = ac.createOscillator();
+    const f = ac.createBiquadFilter(), g = ac.createGain();
+    o.type = 'sawtooth'; o.frequency.value = fr;
+    o2.type = 'square'; o2.frequency.value = fr / 2;          // sub weight
+    f.type = 'lowpass'; f.Q.value = 7;
+    f.frequency.setValueAtTime(1400, t);
+    f.frequency.exponentialRampToValueAtTime(220, t + Math.min(dur, 0.25));
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.32, t + 0.005);
+    g.gain.setValueAtTime(0.32, t + dur * 0.7);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(f); o2.connect(f); f.connect(g); g.connect(this.mus.bus);
+    o.start(t); o2.start(t); o.stop(t + dur + 0.02); o2.stop(t + dur + 0.02);
+  },
+  _pad(t, triad, dur, v) {
+    const ac = this.ac, f = ac.createBiquadFilter(), g = ac.createGain();
+    f.type = 'lowpass'; f.Q.value = 1;
+    f.frequency.setValueAtTime(500, t);
+    f.frequency.linearRampToValueAtTime(2200, t + dur * 0.5);   // filter swell each bar
+    f.frequency.linearRampToValueAtTime(900, t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.06 * v, t + 0.35);
+    g.gain.setValueAtTime(0.06 * v, t + dur * 0.8);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur + 0.3);
+    f.connect(g); g.connect(this.mus.bus); g.connect(this.mus.send);
+    for (const n of triad) for (const det of [-9, 9]) {
+      const o = ac.createOscillator();
+      o.type = 'sawtooth'; o.frequency.value = this._hz(n - 12); o.detune.value = det;
+      o.connect(f); o.start(t); o.stop(t + dur + 0.35);
+    }
+  },
+  _pluck(t, midi, v) {
+    const ac = this.ac, o = ac.createOscillator(), f = ac.createBiquadFilter(), g = ac.createGain();
+    o.type = 'square'; o.frequency.value = this._hz(midi);
+    f.type = 'lowpass';
+    f.frequency.setValueAtTime(4200, t); f.frequency.exponentialRampToValueAtTime(700, t + 0.12);
+    this._env(g, t, v, 0.003, 0.16);
+    o.connect(f); f.connect(g); g.connect(this.mus.bus); g.connect(this.mus.send);
+    o.start(t); o.stop(t + 0.22);
+  },
+  _stab(t, triad, dur) {
+    const ac = this.ac, f = ac.createBiquadFilter(), g = ac.createGain();
+    f.type = 'lowpass'; f.Q.value = 3;
+    f.frequency.setValueAtTime(3200, t); f.frequency.exponentialRampToValueAtTime(600, t + dur);
+    this._env(g, t, 0.13, 0.004, dur);
+    f.connect(g); g.connect(this.mus.bus); g.connect(this.mus.send);
+    for (const n of [triad[0] - 12, ...triad]) {
+      const o = ac.createOscillator();
+      o.type = 'sawtooth'; o.frequency.value = this._hz(n); o.detune.value = (Math.random() - 0.5) * 14;
+      o.connect(f); o.start(t); o.stop(t + dur + 0.05);
+    }
+  },
+  _lead(t, midi, dur) {
+    const ac = this.ac, fr = this._hz(midi);
+    const o = ac.createOscillator(), lfo = ac.createOscillator(), lg = ac.createGain();
+    const f = ac.createBiquadFilter(), g = ac.createGain();
+    o.type = 'sawtooth'; o.frequency.value = fr;
+    lfo.frequency.value = 5.5;                                   // vibrato fades in
+    lg.gain.setValueAtTime(0, t); lg.gain.linearRampToValueAtTime(fr * 0.012, t + dur * 0.4);
+    lfo.connect(lg); lg.connect(o.frequency);
+    f.type = 'lowpass'; f.frequency.value = 2600; f.Q.value = 2;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.07, t + 0.12);
+    g.gain.setValueAtTime(0.07, t + dur * 0.75);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(f); f.connect(g); g.connect(this.mus.bus); g.connect(this.mus.send);
+    o.start(t); lfo.start(t); o.stop(t + dur + 0.05); lfo.stop(t + dur + 0.05);
+  },
+  setMusicMode(mode) {
+    this.wantMode = mode;
+    if (!this.ac || !this.mus) return;   // applied on unlock via _startMusic
+    const m = this.mus;
+    if (m.mode === mode) return;
+    m.mode = mode;
+    // every change lands on a fresh downbeat, so a boss entrance HITS
+    m.step = 0;
+    m.nextT = Math.max(m.nextT, this.ac.currentTime + 0.04);
+    m.delay.delayTime.setTargetAtTime((60 / (this.MUSIC.bpm[mode] || 120)) * 0.75,
+                                      this.ac.currentTime, 0.05);
+  },
+};
+
+// ---------- Title-screen black hole (Interstellar-style, GOLD disk) ----------
+// Event horizon + photon ring + edge-on accretion band + lensed light arcing
+// over the top and mirrored below — the gif recreated procedurally so it
+// matches the game palette, costs zero KB, and animates at 60fps.
+// clipHalfW (optional): hard-clips ALL glow to the reserved letter slot so the
+// accretion disk never washes out the neighbouring letters (readability fix).
+function drawTitleBlackHole(ctx, cx, cy, r, t, clipHalfW) {
+  ctx.save();
+  ctx.translate(cx, cy);
+  if (clipHalfW) {
+    ctx.beginPath();
+    ctx.rect(-clipHalfW, -cy, clipHalfW * 2, 720 - cy);
+    ctx.clip();
+  }
+  ctx.rotate(-0.32 + Math.sin(t * 0.3) * 0.05);  // fixed dramatic tilt + lazy wobble
+  // ghost of the letter, so the title still reads
+  ctx.strokeStyle = 'rgba(255,214,140,0.14)';
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(0, 0, r * 1.1, 0, Math.PI * 2); ctx.stroke();
+  const band = (alpha) => {
+    const g = ctx.createLinearGradient(-r * 1.3, 0, r * 1.3, 0);
+    g.addColorStop(0,    'rgba(255,190,80,0)');
+    g.addColorStop(0.28, `rgba(255,196,90,${0.75 * alpha})`);
+    g.addColorStop(0.5,  `rgba(255,244,214,${0.95 * alpha})`);
+    g.addColorStop(0.72, `rgba(255,184,72,${0.75 * alpha})`);
+    g.addColorStop(1,    'rgba(255,170,60,0)');
+    return g;
+  };
+  // lensed far side of the disk: arcs OVER the top (bright, classic shot)
+  ctx.strokeStyle = band(1);
+  ctx.lineWidth = r * 0.13;
+  ctx.shadowColor = '#ffc85a'; ctx.shadowBlur = 7;
+  ctx.beginPath(); ctx.ellipse(0, -r * 0.1, r * 1.08, r * 0.6, 0, Math.PI * 1.08, Math.PI * 1.92); ctx.stroke();
+  // mirrored arc below (dimmer — the "upside-down reflection")
+  ctx.globalAlpha = 0.5;
+  ctx.beginPath(); ctx.ellipse(0, r * 0.1, r * 1.08, r * 0.6, 0, Math.PI * 1.08, Math.PI * 1.92, true); ctx.stroke();
+  ctx.globalAlpha = 1;
+  // edge-on accretion band across the middle
+  ctx.lineWidth = r * 0.17;
+  ctx.beginPath(); ctx.ellipse(0, 0, r * 1.2, r * 0.28, 0, 0, Math.PI * 2); ctx.stroke();
+  // MAGENTA SWIRL: spiral streaks orbiting the disk — matter being dragged in.
+  // Drawn in the disk's squashed plane (y *= 0.28/1.2) so they read as edge-on,
+  // and modulated so streaks behind the hole fade out.
+  {
+    const sq = 0.28 / 1.2;                          // disk squash ratio
+    const swirl = (phase, rr, alpha) => {
+      ctx.strokeStyle = `rgba(255,77,210,${alpha})`;
+      ctx.shadowColor = '#ff4dd2'; ctx.shadowBlur = 6;
+      ctx.lineWidth = Math.max(1.2, r * 0.05);
+      ctx.beginPath();
+      for (let k = 0; k <= 14; k++) {
+        const f = k / 14;                            // along the streak
+        const ang = phase + f * 1.9;                 // spiral sweep
+        const rad = rr * (1 - f * 0.34);             // spirals inward
+        const x = Math.cos(ang) * rad, y = Math.sin(ang) * rad * sq;
+        if (k === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    };
+    for (let s = 0; s < 3; s++) {
+      const ph = t * 1.9 + s * (Math.PI * 2 / 3);    // orbit speed
+      const front = Math.sin(ph) > 0;                // in front of the hole?
+      swirl(ph, r * (1.24 - s * 0.06), front ? 0.75 : 0.22);
+    }
+    ctx.shadowBlur = 0;
+  }
+  // orbiting flare pip riding the band
+  const a = t * 1.4;
+  const fx = Math.cos(a) * r * 1.2, fy = Math.sin(a) * r * 0.28;
+  ctx.globalAlpha = fy > 0 ? 1 : 0.35;           // behind the hole when up
+  ctx.fillStyle = '#fff6e0';
+  ctx.shadowColor = '#ffdf9a'; ctx.shadowBlur = 10;
+  ctx.beginPath(); ctx.arc(fx, fy, r * 0.09, 0, Math.PI * 2); ctx.fill();
+  ctx.globalAlpha = 1;
+  // event horizon (the dark itself)
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = '#000104';
+  ctx.beginPath(); ctx.arc(0, 0, r * 0.72, 0, Math.PI * 2); ctx.fill();
+  // photon ring — the one absolutely sharp thing
+  ctx.strokeStyle = 'rgba(255,250,235,0.95)';
+  ctx.lineWidth = Math.max(1.5, r * 0.045);
+  ctx.shadowColor = '#ffd98a'; ctx.shadowBlur = 6 + 3 * Math.sin(t * 2);
+  ctx.beginPath(); ctx.arc(0, 0, r * 0.75, 0, Math.PI * 2); ctx.stroke();
+  ctx.restore();
+}
+
+// ---------- Game ----------
+class Game {
+  constructor(canvasEl) {
+    this.gc = new GameCanvas(canvasEl);
+    this.sm = new StateMachine(this);
+    this.starfield = new Starfield();
+    this.particles = new ParticleSystem(500);
+    this.time = 0;
+    this.scrollMult = 1;
+    this.shakeTrauma = 0;
+    this.hitstop = 0;
+    this.gravityDistort = 1;    // Phase 6 Entity field: 1 = normal, <0 = wrong-way pull
+    // persistent run progress (localStorage) + per-run scratch
+    this.run = this._loadProgress();
+    // Phase 8: apply saved audio prefs (context itself waits for a gesture)
+    Snd.sfxVol = this.run.audio.sfx; Snd.musVol = this.run.audio.mus; Snd.muted = this.run.audio.muted;
+    this.summary = null;
+    this.deathTimer = 0;
+    this.boss = null;
+    this.timeScale = 1;
+    this._bindInput(canvasEl);
+    this._registerStates();
+    // debug/test harnesses skip the tap-to-engage boot screen
+    this.sm.to(DEBUG ? 'menu' : 'boot');
+  }
+  _loadProgress() {
+    let p = {};
+    try { p = JSON.parse(localStorage.getItem('void-horizon-save') || '{}'); } catch (e) {}
+    return {
+      unlocked: clamp(p.unlocked || 1, 1, CONFIG.TOTAL_LEVELS),
+      dustTotal: p.dustTotal || 0,
+      lore: Array.isArray(p.lore) ? p.lore : [],   // boss keys killed (Phase 7 LORE screen)
+      // Phase 7 upgrades: photon starts owned at T2 (the Sector-3 unlock promise);
+      // everything else starts at 0. Corrupt/partial saves fall back to defaults.
+      upgrades: (() => {
+      const d = { photon: 2, pulse: 0, void: 0, magnet: 0, hull: 0, charge: 0 };
+      const src = (p.upgrades && typeof p.upgrades === 'object') ? p.upgrades : {};
+      for (const k of Object.keys(d))
+        d[k] = clamp(Math.floor(src[k] === undefined ? d[k] : src[k]), 0, UPGRADES[k].max);
+      // migration: any weapon stuck at T1 (old shop sold it — no autofire/charge,
+      // "gun stopped working" bug) is raised to T2 for free
+      for (const k of Object.keys(d))
+        if (UPGRADES[k].weapon && d[k] === 1) d[k] = 2;
+      return d;
+      })(),
+      equipped: (UPGRADES[p.equipped] && UPGRADES[p.equipped].weapon && p.equipped) || 'photon',
+      // Phase 8: audio prefs (volumes + mute persist with the save)
+      audio: (() => {
+        const a = (p.audio && typeof p.audio === 'object') ? p.audio : {};
+        return { sfx: clamp(a.sfx === undefined ? 0.8 : a.sfx, 0, 1),
+                 mus: clamp(a.mus === undefined ? 0.6 : a.mus, 0, 1),
+                 muted: !!a.muted };
+      })(),
+      level: 1, dist: 0, dust: 0,   // per-run scratch
+    };
+  }
+  // Dust banks the INSTANT it's earned: dying, quitting or closing the tab never
+  // loses any — the only way dust leaves the inventory is spending it in UPGRADES.
+  // run.dust still counts this run's haul for the end-of-run screens.
+  addDust(n) {
+    this.run.dust += n;
+    this.run.dustTotal = (this.run.dustTotal || 0) + n;
+    const now = performance.now();
+    if (!(now - (this._lastSave || 0) < 1500)) { this._lastSave = now; this.saveProgress(); }
+    else this._saveDirty = true;
+  }
+  saveProgress() {
+    this._saveDirty = false;
+    try {
+      localStorage.setItem('void-horizon-save', JSON.stringify({
+        unlocked: this.run.unlocked, dustTotal: this.run.dustTotal, lore: this.run.lore,
+        upgrades: this.run.upgrades, equipped: this.run.equipped, audio: this.run.audio,
+      }));
+    } catch (e) {} // private-mode etc. — game still plays, just no persistence
+  }
+  shake(amount) { this.shakeTrauma = Math.min(1, this.shakeTrauma + amount); }
+
+  _bindInput(canvasEl) {
+    const emit = (type, ev) => {
+      if (ev && ev.preventDefault) ev.preventDefault();
+      let p = null;
+      if (ev && 'clientX' in ev) {
+        p = this.gc.toWorld(ev.clientX, ev.clientY);
+        p.id = ev.pointerId;   // multi-touch: states can tell fingers apart
+      }
+      this.sm.input(type, p);
+    };
+    // fullscreen toggle swallows taps in its corner before any state sees them
+    // (iOS/Android require a user-gesture tap to enter fullscreen)
+    const inFsBtn = (p) => {
+      if (!p) return false;
+      const b = CONFIG.FS_BTN;
+      return (p.x - b.x) ** 2 + (p.y - b.y) ** 2 <= (b.r + 10) ** 2;
+    };
+    const rawEmit = emit;
+    const emit2 = (type, ev) => {
+      if (ev && 'clientX' in ev) {
+        const p = this.gc.toWorld(ev.clientX, ev.clientY);
+        if (type === 'down' && inFsBtn(p)) { this.toggleFullscreen(); return; }
+      }
+      rawEmit(type, ev);
+    };
+    canvasEl.addEventListener('pointerdown', (e) => { Snd.unlock(); emit2('down', e); }, { passive: false });
+    canvasEl.addEventListener('pointerup',   (e) => emit('up', e),   { passive: false });
+    // the OS can steal a touch (edge swipe, notification): treat it as a release so
+    // the FIRE finger can't get stuck down with charge + autofire running forever
+    canvasEl.addEventListener('pointercancel', (e) => emit('up', e), { passive: false });
+    canvasEl.addEventListener('pointermove', (e) => emit('move', e), { passive: false });
+    window.addEventListener('keydown', (ev) => {
+      Snd.unlock();   // keyboard counts as the Chrome autoplay gesture too
+      if ((ev.code === 'Space' || ev.code === 'Enter') && !ev.repeat) { ev.preventDefault(); this.sm.input('down', null); }
+      else if ((ev.code === 'KeyF' || ev.code === 'KeyJ' || ev.code === 'ShiftLeft' || ev.code === 'ShiftRight') && !ev.repeat) {
+        ev.preventDefault(); this.sm.input('fire', null);
+      }
+      else if ((ev.code === 'Escape' || ev.code === 'KeyP') && !ev.repeat) { ev.preventDefault(); this.sm.input('esc', null); }
+    });
+    // switching apps / locking the phone / changing tabs auto-pauses a run
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) this.sm.input('blur', null);
+    });
+    window.addEventListener('keyup', (ev) => {
+      if (ev.code === 'Space' || ev.code === 'Enter') { ev.preventDefault(); this.sm.input('up', null); }
+      else if (ev.code === 'KeyF' || ev.code === 'KeyJ' || ev.code === 'ShiftLeft' || ev.code === 'ShiftRight') {
+        ev.preventDefault(); this.sm.input('fireup', null);
+      }
+    });
+  }
+
+  _registerStates() {
+    // ----- MENU -----
+    // Phase 8: volume sliders (bottom-left of menu; drag = set, release = save)
+    const AUDIO_UI = {
+      sfx:  { x: 70, y: 616, w: 170 },
+      mus:  { x: 70, y: 656, w: 170 },
+      mute: { x: 70, y: 692, w: 170, h: 26 },
+      drag: null,   // 'sfx' | 'mus' | null
+    };
+    function audioHit(p, s) {
+      return p.x >= s.x - 12 && p.x <= s.x + s.w + 12 &&
+             p.y >= s.y - 14 && p.y <= s.y + 14;
+    }
+    function audioSet(kind, p, game) {
+      const s = AUDIO_UI[kind];
+      const v = clamp((p.x - s.x) / s.w, 0, 1);
+      if (kind === 'sfx') {
+        game.run.audio.sfx = v; Snd.setVolumes(v, game.run.audio.mus);
+        if (!Snd.ac) Snd.unlock();       // dragging a slider counts as the gesture
+      } else {
+        game.run.audio.mus = v; Snd.setVolumes(game.run.audio.sfx, v);
+        if (!Snd.ac) Snd.unlock();
+      }
+    }
+    // ----- BOOT ("tap to engage") -----
+    // Browsers block audio until a user gesture, so the cinematic intro waits
+    // for one tap: that tap unlocks Web Audio, fires the riser, and starts the
+    // menu's dissolve-in with the soundtrack in sync.
+    const boot = {
+      go: false,
+      onEnter(game) { game.buttons = []; boot.go = false; Snd.setMusicMode('off'); },
+      input(game, type) {
+        if (boot.go || (type !== 'down' && type !== 'fire')) return;
+        boot.go = true;
+        Snd.unlock();
+        Snd.play('riser');
+        game.sm.to('menu', { intro: true });
+      },
+      render(game, rc) {
+        const ctx = rc, t = game.time;
+        ctx.save();
+        ctx.fillStyle = '#000';                     // pure black: the dissolve starts from here
+        ctx.fillRect(0, 0, CONFIG.WORLD_W, CONFIG.WORLD_H);
+        ctx.textAlign = 'center';
+        ctx.globalAlpha = 0.55 + 0.45 * Math.sin(t * 3);
+        ctx.fillStyle = CONFIG.NEON;
+        ctx.shadowColor = CONFIG.NEON; ctx.shadowBlur = 16;
+        ctx.font = '600 28px "Segoe UI", system-ui, sans-serif';
+        ctx.fillText('▸  TAP TO ENGAGE  ◂', CONFIG.WORLD_W / 2, CONFIG.WORLD_H / 2);
+        ctx.globalAlpha = 0.4; ctx.shadowBlur = 0;
+        ctx.font = '400 16px "Segoe UI", system-ui, sans-serif';
+        ctx.fillText('sound on  ·  headphones recommended', CONFIG.WORLD_W / 2, CONFIG.WORLD_H / 2 + 40);
+        ctx.restore();
+      },
+    };
+
+    // ----- MENU -----
+    // Intro timeline (first launch only, after the boot tap):
+    //   0.0–1.4s  black screen dissolves cell-by-cell from the centre (cyan burn edge)
+    //   0.55s+    title letters materialise one by one (rise + glow flare)
+    //   1.9s      IMPACT: black hole snaps in, flash + shockwave + particles,
+    //             soundtrack drops from the pad swell into the full menu theme
+    //   2.0–3.0s  subtitle, buttons, audio controls fade/slide in
+    // Coming back to the menu later is just a quick 0.35s fade.
+    const INTRO_LEN = 3.0, INTRO_IMPACT = 1.9;
+    const ease = (x) => 1 - Math.pow(1 - clamp(x, 0, 1), 3);              // ease-out cubic
+    const easeBack = (x) => { x = clamp(x, 0, 1); const c = 1.7;          // overshoot pop
+      return 1 + (c + 1) * Math.pow(x - 1, 3) + c * Math.pow(x - 1, 2); };
+    const DISSOLVE = (() => { const r = mulberry32(4242), a = [];          // fixed noise mask
+      for (let i = 0; i < 40 * 23; i++) a.push(r()); return a; })();
+    const menu = {
+      onEnter(game, payload) {
+        const full = !!(payload && payload.intro);
+        game.menuIntro = { t: full ? 0 : INTRO_LEN, full, impact: !full,
+                           fade: full ? 0 : 0.35, flash: 0, ringT: 9, holeX: 0 };
+        Snd.setMusicMode(full ? 'intro' : 'calm');
+        const start = game.run.unlocked;
+        game.buttons = [
+          new Button(start > 1 ? `PLAY — SECTOR ${start}` : 'PLAY', 490, 360, 300, 62,
+            () => game.sm.to('playing', { level: start })),
+          new Button('UPGRADES', 490, 440, 300, 62, () => game.sm.to('upgrades')),
+          new Button('LORE', 490, 520, 300, 62, () => game.sm.to('lore')),
+        ];
+      },
+      _impact(game) {
+        const I = game.menuIntro;
+        I.impact = true; I.flash = 1; I.ringT = 0;
+        Snd.play('impact');
+        Snd.setMusicMode('calm');                     // the drop: full menu theme kicks in
+        game.shake(0.7);
+        const hx = I.holeX || CONFIG.WORLD_W / 2;
+        game.particles.burst(hx, 232, 60, '#ffc85a', 720, 1.0, 3.5);
+        game.particles.burst(hx, 232, 30, CONFIG.ACCENT, 520, 0.9, 3);
+      },
+      input(game, type, p) {
+        const I = game.menuIntro;
+        if (I && I.t < INTRO_LEN) {                   // intro playing: a tap skips to the end
+          if (type === 'down') { I.t = INTRO_LEN; if (!I.impact) menu._impact(game); }
+          return;
+        }
+        if (type === 'move' && p && AUDIO_UI.drag) { audioSet(AUDIO_UI.drag, p, game); return; }
+        if (type === 'move') {
+          for (const b of game.buttons) b.hover = b.contains(p);
+        } else if (type === 'down' && p) {
+          if (audioHit(p, AUDIO_UI.sfx)) { AUDIO_UI.drag = 'sfx'; audioSet('sfx', p, game); return; }
+          if (audioHit(p, AUDIO_UI.mus)) { AUDIO_UI.drag = 'mus'; audioSet('mus', p, game); return; }
+          if (p.x >= AUDIO_UI.mute.x - 12 && p.x <= AUDIO_UI.mute.x + AUDIO_UI.mute.w + 12 &&
+              p.y >= AUDIO_UI.mute.y - 14 && p.y <= AUDIO_UI.mute.y + AUDIO_UI.mute.h) {
+            game.run.audio.muted = Snd.toggleMute(); game.saveProgress(); return;
+          }
+          for (const b of game.buttons) {
+            if (b.contains(p)) { b.pressT = 1; Snd.play('ui'); b.action(); return; }
+          }
+        } else if (type === 'up' && !p) {
+          if (AUDIO_UI.drag) { AUDIO_UI.drag = null; game.saveProgress(); return; }
+          game.sm.to('playing', { level: game.run.unlocked }); // keyboard Enter/Space starts
+        } else if (type === 'up' && p && AUDIO_UI.drag) {
+          AUDIO_UI.drag = null; game.saveProgress(); return;
+        } else if (type === 'esc') {
+          game.sm.to('menu'); // harmless
+        }
+      },
+      update(game, dt) {
+        const I = game.menuIntro;
+        if (I.t < INTRO_LEN) I.t += dt;
+        if (!I.impact && I.t >= INTRO_IMPACT) menu._impact(game);
+        I.fade = Math.max(0, I.fade - dt);
+        I.flash = Math.max(0, I.flash - dt * 2.5);
+        I.ringT += dt;
+        for (const b of game.buttons) b.update(dt);
+      },
+      render(game, rc) {
+        const ctx = rc, t = game.time, I = game.menuIntro;
+        ctx.textAlign = 'center';
+        ctx.save();
+        ctx.fillStyle = '#eaffff';
+        ctx.font = '700 84px "Segoe UI", system-ui, sans-serif';
+        // draw the title letter-by-letter, swapping the O in VOID for a live black hole.
+        // Accretion band half-width is r*1.32 = 0.73 letter-widths, so 1.8x
+        // advance keeps clearance per side without a visual chasm.
+        const title = 'VOID HORIZON';
+        const tw = ctx.measureText(title).width + ctx.measureText('O').width * 0.8;
+        let lx = CONFIG.WORLD_W / 2 - tw / 2;
+        ctx.textAlign = 'left';              // per-glyph advance needs LEFT
+        let holeDone = false, idx = 0;
+        for (const ch of title) {
+          const cw = ctx.measureText(ch).width;
+          const start = 0.55 + idx * 0.07;   // staggered materialise
+          idx++;
+          if (ch === 'O' && !holeDone) {
+            holeDone = true;
+            const hx = lx + cw * 0.9;
+            I.holeX = hx;
+            // the hole snaps in with an overshoot right on the impact beat
+            const hr = cw * 0.55 * (I.impact ? 1 : easeBack((I.t - (INTRO_IMPACT - 0.25)) / 0.25));
+            // clipped to the reserved O slot so the glow can't wash out D and I
+            if (hr > 0.5) drawTitleBlackHole(ctx, hx, 260 - 28, hr, t, cw * 0.9);
+            lx += cw * 1.8;
+          } else {
+            const a = ease((I.t - start) / 0.5);
+            if (a > 0) {
+              ctx.save();
+              ctx.globalAlpha = a;
+              ctx.shadowColor = CONFIG.NEON;
+              ctx.shadowBlur = 24 + 10 * Math.sin(t * 1.5) + (1 - a) * 50;   // flares as it forms
+              ctx.fillText(ch, lx, 260 + (1 - a) * 28);
+              ctx.restore();
+            }
+            lx += cw;
+          }
+        }
+        ctx.textAlign = 'center';
+        ctx.globalAlpha = ease((I.t - 1.95) / 0.5);
+        ctx.fillStyle = CONFIG.NEON_DIM;
+        ctx.font = '400 22px "Segoe UI", system-ui, sans-serif';
+        ctx.fillText('DUAL-GRAVITY PROTOCOL // SECTOR WAR', CONFIG.WORLD_W / 2, 315);
+        ctx.restore();
+
+        // impact shockwave ring + particles
+        if (I.ringT < 0.7) {
+          ctx.save();
+          ctx.globalAlpha = 1 - I.ringT / 0.7;
+          ctx.strokeStyle = '#ffc85a'; ctx.shadowColor = '#ffc85a'; ctx.shadowBlur = 20;
+          ctx.lineWidth = 6 * (1 - I.ringT / 0.7) + 1;
+          ctx.beginPath(); ctx.arc(I.holeX, 232, 40 + ease(I.ringT / 0.7) * 700, 0, Math.PI * 2); ctx.stroke();
+          ctx.restore();
+        }
+        game.particles.render(ctx);
+
+        // buttons slide up + fade in, staggered
+        game.buttons.forEach((b, i) => {
+          const a = ease((I.t - 2.1 - i * 0.13) / 0.45);
+          if (a <= 0) return;
+          ctx.save();
+          ctx.globalAlpha = a;
+          ctx.translate(0, (1 - a) * 24);
+          b.render(ctx, t);
+          ctx.restore();
+        });
+
+        // Phase 8: SFX / Music sliders + MUTE (bottom-left)
+        const a = game.run.audio;
+        ctx.save();
+        ctx.globalAlpha = ease((I.t - 2.5) / 0.5);
+        ctx.textAlign = 'left';
+        ctx.font = '600 15px "Segoe UI", system-ui, sans-serif';
+        for (const [label, s, v] of [['SFX', AUDIO_UI.sfx, a.sfx], ['MUSIC', AUDIO_UI.mus, a.mus]]) {
+          ctx.fillStyle = CONFIG.NEON_DIM;
+          ctx.fillText(label, s.x, s.y - 10);
+          ctx.strokeStyle = 'rgba(77,232,255,0.45)';
+          ctx.lineWidth = 3;
+          ctx.beginPath(); ctx.moveTo(s.x, s.y); ctx.lineTo(s.x + s.w, s.y); ctx.stroke();
+          ctx.fillStyle = a.muted ? 'rgba(77,232,255,0.3)' : CONFIG.NEON;
+          ctx.beginPath(); ctx.arc(s.x + s.w * v, s.y, 7, 0, Math.PI * 2); ctx.fill();
+        }
+        const mu = AUDIO_UI.mute;
+        ctx.strokeStyle = a.muted ? CONFIG.WARN : 'rgba(77,232,255,0.45)';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(mu.x, mu.y - 9, mu.w, mu.h);
+        ctx.fillStyle = a.muted ? CONFIG.WARN : CONFIG.NEON_DIM;
+        ctx.fillText(a.muted ? 'AUDIO: MUTED' : 'AUDIO: ON', mu.x + 10, mu.y + 9);
+        ctx.restore();
+
+        // DISSOLVE: the black screen breaks apart cell-by-cell (seeded noise mask,
+        // centre clears first) with a cyan "burn" on cells about to vanish
+        if (I.full && I.t < 1.45) {
+          const p = ease(I.t / 1.4), cs = 32;
+          ctx.save();
+          for (let gy = 0, k = 0; gy < 23; gy++) {
+            for (let gx = 0; gx < 40; gx++, k++) {
+              const r = DISSOLVE[k] * 0.85 + (Math.abs(gx - 19.5) / 19.5) * 0.15;
+              if (r <= p) continue;
+              ctx.fillStyle = r - p < 0.05 ? 'rgba(77,232,255,0.55)' : '#000';
+              ctx.fillRect(gx * cs, gy * cs, cs + 1, cs + 1);
+            }
+          }
+          ctx.restore();
+        }
+        // impact flash / quick return fade
+        if (I.flash > 0 || I.fade > 0) {
+          ctx.save();
+          if (I.flash > 0) {
+            ctx.globalAlpha = I.flash * 0.35; ctx.fillStyle = '#eaffff';
+            ctx.fillRect(0, 0, CONFIG.WORLD_W, CONFIG.WORLD_H);
+          }
+          if (I.fade > 0) {
+            ctx.globalAlpha = I.fade / 0.35; ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, CONFIG.WORLD_W, CONFIG.WORLD_H);
+          }
+          ctx.restore();
+        }
+      },
+    };
+
+    // ----- LORE ARCHIVE (real screen: dossier list + reader pane) -----
+    // The narrator is the ship's log; ~~struck text~~ renders as real strikethrough
+    // (the log editing itself), ██ is just a redaction glyph.
+    const LORE_PROLOGUE = {
+      key: 'prologue', title: 'PROLOGUE // WHO IS FLYING', faction: '',
+      text: "LOG // this ship has no registered pilot. the seat sensors ~~report a heartbeat~~ read ambient. " +
+            "the contract that funds this corridor run was issued by an office that ~~closed~~ never existed. " +
+            "the cargo hold pays in dust, the dust buys fire, the fire buys the next sector. " +
+            "i do not remember enlisting. i do not remember ~~the first nine deaths~~ most of the first nine deaths. " +
+            "the corridor is old — older than the factions swarming it — and it slopes downward, " +
+            "gently, the way a drain slopes. everything out here is falling. " +
+            "i am simply the only one falling ~~on purpose~~ with the guns on.",
+    };
+    const LORE_EPILOGUE = {
+      key: 'entity', title: 'EPILOGUE // IT', faction: 'THE BLACK HOLE',
+      lock: g => g.run.lore.includes('entity'),
+      text: "LOG // nine fires out. the corridor is quiet in a way it has never been — not silent, " +
+            "settled, like a machine that stopped being wound. the hole at the end does not rage anymore. " +
+            "it was never a throne and never a god. it was a ~~door~~ a drain, and the factions were " +
+            "not its priests, only the silt that gathered where the current slowed. " +
+            "i killed nine of its fevers and called it a war. " +
+            "the horizon is thin here. the log keeps editing itself faster now, as if ~~we~~ i am running out of pages. " +
+            "i am going to fly in and file one last entry, and if this entry ends mid-sentence, " +
+            "understand that the sentence is not wh",
+    };
+    function loreEntries(game) {
+      const list = [LORE_PROLOGUE];
+      for (const f of LORE_FACTIONS) {
+        list.push({ key: 'f_' + f.id, title: f.title, faction: f.faction,
+                    text: f.text, lock: f.lock });
+      }
+      list.push(LORE_EPILOGUE);
+      return list;
+    }
+    // faction dossiers: header prose + the boss entries they dropped
+    const LORE_FACTIONS = [
+      { id: 'corridor', title: 'THE CORRIDOR', faction: 'THE ARENA', lock: () => true,
+        text: "LOG // nobody built the corridor. survey drones agree on one thing: the rails are older " +
+              "than every faction that crawls on them. it runs ~50 sectors and every one of them tilts " +
+              "a degree more toward the hole. gravity here is not law, it is ~~suggestion~~ drainage. " +
+              "the factions did not choose this war. they chose the high ground in a drain." },
+      { id: 'vexill', title: 'VEXILL HIVE', faction: 'THE FEEDER', lock: g => g.run.lore.includes('vexill'),
+        text: "LOG // the Hive came first and will come last — billions of insectile drones grown around " +
+              "a breeding mind, seeded down the corridor like bait. they do not hold territory. they grow " +
+              "toward the hole and eat what blocks them. two gardeners fell to us: Krixtha, then Hive-Mother Ossu. " +
+              "the garden ~~stopped growing~~ kept growing either way." },
+      { id: 'korvaati', title: 'KOR-VAATI LEGION', faction: 'THE BLADE', lock: g => g.run.lore.includes('korvaati'),
+        text: "LOG // the Legion fights like it is being graded: aimed volleys, telegraphed sweeps, contempt " +
+              "for cover. they believe the corridor is a proving ground and the hole is the honor roll at the " +
+              "bottom of it. Vaal Kor-Sun saluted us. Kaalen-Vaa fused captured laser tech into the Legion " +
+              "volley — heresy, and effective. the Legion mourned her the way you mourn a blade that cut you." },
+      { id: 'nethys', title: 'NETHYS CHOIR', faction: 'THE HYMN', lock: g => g.run.lore.includes('nethys'),
+        text: "LOG // the Choir sings in fire. their spiral litanies are precise enough to engrave hull plate, " +
+              "and they insist the corridor is a pipe organ — that gravity is the note and every ship that " +
+              "falls in is ~~acoustics~~ an offering. the Chorus fell, then Resonant Vael sang her own requiem " +
+              "over her sinking core. our recorders still catch the harmonics three sectors out. the cats hate that frequency." },
+      { id: 'drathis', title: 'DRATHIS COMPACT', faction: 'THE INVOICE', lock: g => g.run.lore.includes('drathis'),
+        text: "LOG // the Compact sell war by the kilogram and have never once fought it personally. " +
+              "Bastion DR-9 was a demo unit. Siege Engine TH-0 was their last invoice: a platform that " +
+              "paid for itself by never being allowed to lose. they call the corridor a test range " +
+              "~~leased by whom~~ and every kill we made was data they were paying to collect. we returned TH-0 to sender, restocked as debris." },
+      { id: 'umbral', title: 'UMBRAL COURT', faction: 'THE COURIERS', lock: g => g.run.lore.includes('umbral'),
+        text: "LOG // the Court claims to speak for what waits past the dark. the Herald carried every " +
+              "faction's fire like samples — all styles, no loyalty. it was not a commander. it was a " +
+              "~~priest~~ messenger, and the message was the same one the corridor has been posting for a " +
+              "thousand years: everything in the drain arrives at the drain. the Black Hole at the end " +
+              "is its destination, not its throne." },
+    ];
+    function wrapLog(text, max) {
+      const words = text.split(' '); const lines = []; let cur = '';
+      for (const w of words) {
+        if ((cur + ' ' + w).trim().length > max) { lines.push(cur.trim()); cur = w; }
+        else cur += ' ' + w;
+      }
+      if (cur.trim()) lines.push(cur.trim());
+      return lines;
+    }
+    const lore = {
+      selected: null,
+      onEnter(game) {
+        lore.selected = LORE_PROLOGUE;
+        game.buttons = [ new Button('BACK', 1010, 60, 120, 44, () => game.sm.to('menu')) ];
+      },
+      input(game, type, p) {
+        if (type === 'move') { for (const b of game.buttons) b.hover = b.contains(p); return; }
+        if (type === 'esc') { game.sm.to('menu'); return; }
+        if (type === 'down' && p) {
+          for (const b of game.buttons)
+            if (b.contains(p)) { b.pressT = 1; Snd.play('ui'); b.action(); return; }
+          // entry list hits
+          const list = loreEntries(game);
+          const y0 = 190, rowH = 62;
+          if (p.x >= 80 && p.x <= 520) {
+            const i = Math.floor((p.y - y0) / rowH);
+            if (i >= 0 && i < list.length) {
+              const e = list[i];
+              if (!e.lock || e.lock(game)) lore.selected = e;
+              else game.shake(0.4);
+            }
+          }
+        }
+      },
+      update(game, dt) { for (const b of game.buttons) b.update(dt); },
+      render(game, rc) {
+        const ctx = rc, t = game.time;
+        ctx.textAlign = 'center';
+        ctx.save();
+        ctx.shadowColor = CONFIG.NEON; ctx.shadowBlur = 14;
+        ctx.fillStyle = '#eaffff';
+        ctx.font = '700 40px "Segoe UI", system-ui, sans-serif';
+        ctx.fillText('SHIP\u2019S LOG // ARCHIVE', CONFIG.WORLD_W / 2, 120);
+        ctx.restore();
+        // left: entry list
+        const list = loreEntries(game), y0 = 190, rowH = 62;
+        ctx.textAlign = 'left';
+        list.forEach((e, i) => {
+          const unlocked = !e.lock || e.lock(game);
+          const y = y0 + i * rowH;
+          const sel = lore.selected === e;
+          ctx.save();
+          ctx.strokeStyle = sel ? CONFIG.NEON : (unlocked ? CONFIG.NEON_DIM : 'rgba(120,130,150,0.25)');
+          ctx.fillStyle = sel ? 'rgba(77,232,255,0.08)' : 'rgba(0,0,0,0.25)';
+          ctx.lineWidth = sel ? 2 : 1;
+          ctx.beginPath(); ctx.roundRect(80, y, 440, rowH - 10, 8); ctx.fill(); ctx.stroke();
+          ctx.fillStyle = unlocked ? (sel ? '#eaffff' : '#9fd8e8') : '#5a6472';
+          ctx.font = '700 20px "Segoe UI", system-ui, sans-serif';
+          ctx.fillText(unlocked ? e.title : '\u2588\u2588\u2588\u2588\u2588\u2588 // SIGNAL LOST', 98, y + 27);
+          ctx.fillStyle = unlocked ? CONFIG.NEON_DIM : '#4a5260';
+          ctx.font = '400 14px "Segoe UI", system-ui, sans-serif';
+          ctx.fillText(unlocked ? (e.faction || 'UNVERIFIED') : 'REQUIRES PROOF', 98, y + 45);
+          ctx.restore();
+        });
+        // right: reader pane with live strikethrough rendering
+        const e = lore.selected;
+        ctx.save();
+        ctx.strokeStyle = CONFIG.NEON_DIM; ctx.lineWidth = 1;
+        ctx.fillStyle = 'rgba(0,0,0,0.3)';
+        ctx.beginPath(); ctx.roundRect(560, 180, 640, 470, 10); ctx.fill(); ctx.stroke();
+        ctx.fillStyle = '#eaffff'; ctx.font = '700 24px "Segoe UI", system-ui, sans-serif';
+        ctx.textAlign = 'left';
+        ctx.fillText(e.title, 590, 225);
+        ctx.fillStyle = CONFIG.NEON_DIM; ctx.font = '400 14px "Segoe UI", system-ui, sans-serif';
+        ctx.fillText(e.faction ? 'SOURCE: ' + e.faction : 'SOURCE: UNVERIFIED', 590, 248);
+        ctx.font = '400 18px "Segoe UI", system-ui, sans-serif';
+        let y = 290;
+        for (const line of wrapLog(e.text, 62)) {
+          let x = 590;
+          // split ~~struck~~ segments: struck gets a real line-through (log edits itself)
+          const parts = line.split('~~');
+          parts.forEach((seg, si) => {
+            const struck = si % 2 === 1;
+            if (seg) {
+              ctx.fillStyle = struck ? '#5a6472' : '#cfe9f2';
+              ctx.fillText(seg, x, y);
+              const wdt = ctx.measureText(seg).width;
+              if (struck) {
+                ctx.strokeStyle = '#8a94a4'; ctx.lineWidth = 1.4;
+                ctx.beginPath(); ctx.moveTo(x, y - 6); ctx.lineTo(x + wdt, y - 6); ctx.stroke();
+              }
+              x += wdt;
+            }
+          });
+          y += 30;
+        }
+        // faint scanline flicker on the reader = corrupted archive
+        ctx.globalAlpha = 0.04 + 0.02 * Math.sin(t * 7);
+        ctx.fillStyle = CONFIG.NEON;
+        ctx.fillRect(560, 180 + ((t * 60) % 470), 640, 2);
+        ctx.restore();
+        for (const b of game.buttons) b.render(ctx, t);
+      },
+    };
+
+    // ----- UPGRADES (Phase 7 shop: 6 branches, buy + equip, dust currency) -----
+    const upgrades = {
+      _rows: [],
+      onEnter(game) {
+        this._rows = Object.keys(UPGRADES).map((k, i) => ({ key: k, ...UPGRADES[k], i }));
+        this._err = 0;   // transient "not enough dust" flash timer
+      },
+      _act(game) {
+        game.saveProgress();
+        this.onEnter(game);   // rebuild rows with fresh costs
+      },
+      input(game, type, p) {
+        if (type === 'esc') { game.sm.to('menu'); return; }
+        if (type === 'up' && !p) { game.sm.to('menu'); return; }   // keyboard: Space = back
+        if (type !== 'down' || !p) return;
+        for (const r of this._rows) {
+          const bx = 1010, by = 190 + r.i * 78;
+          if (p.x >= bx && p.x <= bx + 190 && p.y >= by && p.y <= by + 52) {
+            const cur = game.run.upgrades[r.key];
+            const cost = upgCost(r.key, cur);
+            if (cost === null) continue;                     // maxed
+            if (game.run.dustTotal < cost) { this._err = 0.5; game.shake(0.2); return; }
+            game.run.dustTotal -= cost;
+            // first weapon tier grants T2 (charge + autofire online instantly) —
+            // same promise Photon got at Sector 3. A T1 weapon has no autofire
+            // (charge-ring gate) and no charged shot, so selling T1 meant
+            // "buy new gun -> gun stops working" (user-reported bug).
+            game.run.upgrades[r.key] = (r.weapon && cur === 0) ? 2 : cur + 1;
+            if (r.weapon && cur === 0) game.run.equipped = r.key;    // auto-equip new weapon
+            this._act(game);
+            return;
+          }
+          // weapon name = equip toggle
+          if (r.weapon && p.x >= 120 && p.x <= 420 && p.y >= 190 + r.i * 78 && p.y <= 190 + r.i * 78 + 52) {
+            if (game.run.upgrades[r.key] >= 1) { game.run.equipped = r.key; this._act(game); }
+            return;
+          }
+        }
+        if (p.y > 640) game.sm.to('menu');
+      },
+      update(game, dt) { this._err = Math.max(0, this._err - dt); },
+      render(game, rc) {
+        const ctx = rc, t = game.time;
+        ctx.textAlign = 'center';
+        ctx.save();
+        ctx.shadowColor = CONFIG.NEON; ctx.shadowBlur = 16;
+        ctx.fillStyle = '#eaffff';
+        ctx.font = '700 44px "Segoe UI", system-ui, sans-serif';
+        ctx.fillText('UPGRADES', CONFIG.WORLD_W / 2, 100);
+        ctx.shadowBlur = 0;
+        ctx.font = '600 26px "Segoe UI", system-ui, sans-serif';
+        ctx.fillStyle = this._err > 0 ? CONFIG.ACCENT : CONFIG.WARN;
+        ctx.fillText(`◆ ${game.run.dustTotal} dust` + (this._err > 0 ? '   NOT ENOUGH DUST' : ''),
+                     CONFIG.WORLD_W / 2, 145);
+        ctx.restore();
+        for (const r of this._rows) {
+          const y = 190 + r.i * 78, cur = game.run.upgrades[r.key];
+          const equipped = game.run.equipped === r.key;
+          ctx.save();
+          ctx.strokeStyle = equipped ? CONFIG.NEON : 'rgba(77,232,255,0.25)';
+          ctx.lineWidth = equipped ? 2 : 1;
+          ctx.fillStyle = equipped ? 'rgba(77,232,255,0.07)' : 'rgba(77,232,255,0.02)';
+          ctx.beginPath(); ctx.roundRect(120, y, 1080, 52, 8); ctx.fill(); ctx.stroke();
+          ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+          ctx.fillStyle = cur >= 1 || !r.weapon ? '#eaffff' : CONFIG.NEON_DIM;
+          ctx.font = '600 20px "Segoe UI", system-ui, sans-serif';
+          ctx.fillText(r.name + (equipped ? '  [EQUIPPED]' : (r.weapon && cur >= 1 ? '  [tap to equip]' : '')),
+                       140, y + 16);
+          ctx.fillStyle = CONFIG.NEON_DIM;
+          ctx.font = '400 14px "Segoe UI", system-ui, sans-serif';
+          ctx.fillText(r.desc, 140, y + 37);
+          // tier pips
+          for (let k = 1; k <= r.max; k++) {
+            ctx.beginPath();
+            ctx.arc(740 + k * 20, y + 26, 7, 0, Math.PI * 2);
+            ctx.fillStyle = k <= cur ? CONFIG.NEON : 'rgba(77,232,255,0.15)';
+            ctx.fill();
+          }
+          // buy button
+          const cost = upgCost(r.key, cur);
+          const bx = 1010;
+          ctx.beginPath(); ctx.roundRect(bx, y, 190, 52, 8);
+          if (cost === null) {
+            ctx.fillStyle = 'rgba(77,232,255,0.06)'; ctx.fill();
+            ctx.fillStyle = CONFIG.NEON_DIM; ctx.textAlign = 'center';
+            ctx.font = '600 18px "Segoe UI", system-ui, sans-serif';
+            ctx.fillText('MAX', bx + 95, y + 26);
+          } else {
+            const afford = game.run.dustTotal >= cost;
+            ctx.strokeStyle = afford ? CONFIG.WARN : 'rgba(255,200,87,0.25)';
+            ctx.lineWidth = afford ? 2 : 1;
+            ctx.stroke();
+            ctx.fillStyle = afford ? CONFIG.WARN : 'rgba(255,200,87,0.35)';
+            ctx.textAlign = 'center';
+            ctx.font = '600 18px "Segoe UI", system-ui, sans-serif';
+            ctx.fillText((cur === 0 ? 'BUY' : 'TIER ' + (cur + 1)) + `  ◆${cost}`, bx + 95, y + 26);
+          }
+          ctx.restore();
+        }
+        ctx.textAlign = 'center';
+        ctx.fillStyle = 'rgba(77,232,255,0.4)';
+        ctx.font = '400 18px "Segoe UI", system-ui, sans-serif';
+        ctx.fillText('TAP a BUY button to purchase  ·  tap a weapon name to equip  ·  ESC / SPACE = MENU   ·   weapon TIER 2+ = charged shot',
+                     CONFIG.WORLD_W / 2, 665);
+      },
+    };
+
+    // ----- PLAYING (level run: obstacles, dust, quota, death) -----
+    const playing = {
+      onEnter(game, payload) {
+        const lvl = (payload && payload.level) || game.run.level || 1;
+        game.run.level = lvl;
+        game.run.dist = 0;
+        game.run.dust = 0;
+        game.player = game.player || new Player(game);
+        game.player.reset();
+        game.player.alive = true;
+        game.corridor = game.corridor || new Corridor();
+        game.levelCfg = LevelConfig(lvl);
+        game.field = new ObstacleField(game, game.levelCfg);
+        game.weapon = game.weapon || new Weapon(game);
+        game.weapon.reset();           // _syncGate(): lock gate + equipped variant
+        game.scrollMult = 2.6 * (game.levelCfg.speed / CONFIG.BASE_SCROLL);
+        game._firePointer = false;
+        game.timeScale = 1;
+        Snd.setMusicMode('play');
+        // Phase 5: boss sectors spawn the fight; level 50 = the Entity (Phase 6)
+        game.gravityDistort = 1;
+        game.boss = (lvl === CONFIG.TOTAL_LEVELS) ? new Entity(game)
+                  : isBossLevel(lvl) ? new Boss(game, lvl / 5) : null;
+        game.paused = false; game.resumeT = 0;
+      },
+      // ---- pause: freeze the run, overlay menu, 3-2-1 countdown on resume ----
+      _pause(game) {
+        if (game.paused || !game.player.alive) return;
+        game.paused = true; game.resumeT = 0;
+        const W = game.weapon;                    // let go of FIRE so nothing is stuck held
+        W.fireHold.down = false; W.fireHold.charging = false; W.fireHold.t = 0;
+        game._firePointerId = null;
+        game.saveProgress();                      // pausing (or app-switch) flushes the bank
+        game.pauseMusic = Snd.wantMode;
+        Snd.setMusicMode('intro');                // soundtrack drops to a quiet pad
+        Snd.play('ui');
+        game.pauseButtons = [
+          new Button('RESUME', 490, 300, 300, 62, () => playing._resume(game)),
+          new Button('RESTART SECTOR', 490, 380, 300, 62,
+            () => game.sm.to('playing', { level: game.run.level })),
+          new Button('MAIN MENU', 490, 460, 300, 62, () => game.sm.to('menu')),
+        ];
+      },
+      _resume(game) {
+        game.paused = false;
+        game.resumeT = 0.9;                       // 3-2-1, then live
+        Snd.setMusicMode(game.pauseMusic || 'play');
+      },
+      _hitPauseBtn(p) {
+        const b = CONFIG.PAUSE_BTN;
+        return (p.x - b.x) ** 2 + (p.y - b.y) ** 2 <= (b.r + 12) ** 2;
+      },
+      onExit(game) { game.saveProgress(); game.paused = false; game.resumeT = 0; game.scrollMult = 1; game.timeScale = 1; game.gravityDistort = 1; Snd.setMusicMode('calm'); },
+      _die(game) {
+        const P = game.player;
+        if (!P.alive) return;
+        P.alive = false;
+        Snd.play('die');
+        game.shake(0.9);
+        game.hitstop = 0.09;
+        game.particles.burst(P.x, P.y, 40, CONFIG.WARN, 620, 0.8, 4);
+        game.particles.burst(P.x, P.y, 24, CONFIG.ACCENT, 480, 0.7, 3);
+        // small delay so the explosion reads before the summary screen
+        game.deathTimer = 0.7;
+      },
+      input(game, type, p) {
+        if (!game.player.alive) return;
+        const W = game.weapon;
+        if (game.paused) {
+          if (type === 'move' && p) { for (const b of game.pauseButtons) b.hover = b.contains(p); }
+          else if (type === 'esc') playing._resume(game);
+          else if (type === 'down' && p) {
+            for (const b of game.pauseButtons)
+              if (b.contains(p)) { b.pressT = 1; Snd.play('ui'); b.action(); return; }
+          }
+          return;
+        }
+        if (type === 'blur' || type === 'esc') { playing._pause(game); return; }
+        if (game.resumeT > 0) return;             // countdown: hands off
+        if (type === 'move') return;
+        if (type === 'down' && p && playing._hitPauseBtn(p)) { playing._pause(game); return; }
+        if (type === 'down') {
+          // tap anywhere (outside the FIRE button) = flip gravity, instantly
+          if (p && !W.locked && playing._hitFireBtn(p)) {
+            game._firePointerId = p.id;   // this finger is now the fire finger
+            playing._fireDown(game);
+          } else {
+            game.player.requestFlip();
+          }
+        } else if (type === 'fire') {
+          playing._fireDown(game);
+        } else if (type === 'fireup') {
+          playing._fireUp(game);
+        } else if (type === 'up') {
+          // only the fire finger's release triggers the shot (multi-touch safe)
+          if (p && game._firePointerId === p.id) {
+            game._firePointerId = null;
+            playing._fireUp(game);
+          }
+        }
+      },
+      _hitFireBtn(p) {
+        const b = CONFIG.FIRE_BTN;
+        return (p.x - b.x) ** 2 + (p.y - b.y) ** 2 <= (b.r + 14) ** 2; // generous touch radius
+      },
+      _fireDown(game) {
+        const W = game.weapon;
+        if (W.locked) return;
+        const h = W.fireHold;
+        if (h.down) return;            // already holding (ignores repeat events)
+        h.down = true; h.t = 0; h.charging = false;
+        // release grace: a re-hold right after a charged shot skips the 450ms
+        // latch delay (h.t pre-set; tapHoldTick latches on the NEXT update —
+        // a quick tap without an intervening tick still decides as 'flip', so
+        // tap-bolt semantics are untouched)
+        if (W.graceT > 0) h.t = CONFIG.CHARGE_MS / 1000 + 0.01;
+      },
+      _fireUp(game) {
+        const W = game.weapon;
+        const decision = tapHoldDecide(W.fireHold);
+        if (decision === 'charged') {
+          W.fireCharged(W.variant, game.player.x + 10, game.player.y);
+          // RELEASE GRACE: the capacitor keeps 55% AND the next hold resumes
+          // charging INSTANTLY (h.t pre-set past the latch delay) — the beam
+          // is a burst ON TOP of sustained autofire, not a reset tax.
+          // (was: chargeT = 0 + 450ms re-latch, ~0.45s autofire stall per
+          //  release, which made holding-forever the best strategy)
+          game.player.chargeT = 0.55;
+          // tapHoldDecide already cleared fireHold.down, so arm a short grace
+          // WINDOW instead: a deliberate RE-GRIP (held >0.15s) within 0.8s
+          // resumes charging at once — a quick tap still reads as a tap bolt.
+          W.graceT = 0.8;
+        } else if (decision === 'flip') {   // quick tap = weak bolt
+          W.fireWeak();
+        }
+      },
+      update(game, dt) {
+        if (game.paused) { for (const b of game.pauseButtons) b.update(dt); return; }
+        if (game.resumeT > 0) { game.resumeT = Math.max(0, game.resumeT - dt); return; }
+        // death animation -> game over screen
+        if (!game.player.alive) {
+          game.deathTimer -= dt;
+          if (game.deathTimer <= 0) {
+            game.sm.to('game_over', {
+              level: game.run.level, dist: game.run.dist, dust: game.run.dust,
+              quota: game.levelCfg.quota,
+            });
+          }
+          return;
+        }
+        const h = game.weapon.fireHold;
+        tapHoldTick(h, dt, CONFIG.CHARGE_MS, game.weapon.chargeEnabled);
+        if (h.charging) {
+          const cT = game.run.upgrades ? game.run.upgrades.charge : 0;
+          game.player.chargeT = Math.min(1, game.player.chargeT + dt * 1.6 * CHARGE_MULT[cT]);
+        }
+        else game.player.chargeT = Math.max(0, game.player.chargeT - dt * 4);
+        const B = game.boss;
+        if (B) B.update(dt);
+        const locked = B && B.state !== 'approach';   // camera lock during the fight
+        const speed = locked ? 0 : game.levelCfg.speed;
+        game.corridor.update(dt, speed);
+        game.player.update(dt);
+        game.field.update(dt, speed);
+        game.weapon.update(dt, game.field, B);
+        game.run.dist += speed * dt;
+
+        // collisions — shields soak hits with i-frames; 0 shields = ship lost
+        let hit = game.field.collide(game.player.x, game.player.y,
+                                     CONFIG.PLAYER_R * CONFIG.HITBOX_FACTOR, dt);
+        // (was `!hit`: a dust pickup returned 'dust', which skipped boss-bullet checks that frame)
+        if (hit !== 'hit' && B) hit = B.collide(game.player.x, game.player.y,
+                                                CONFIG.PLAYER_R * CONFIG.HITBOX_FACTOR) || hit;
+        // pay out every orb grabbed this frame — even a frame where you also take a (fatal) hit
+        if (game.field.dustCount > 0) {
+          game.addDust(CONFIG.DUST_PER_OBSTACLE * game.field.dustCount);
+          Snd.play('dust');
+          game.particles.burst(game.player.x, game.player.y, 6, CONFIG.WARN, 260, 0.35, 2.4);
+        }
+        if (hit === 'hit') {
+          if (game.player.iframes <= 0) {
+            game.player.shields -= 1;
+            Snd.play('hurt');
+            if (game.player.shields <= 0) { playing._die(game); return; }
+            game.player.iframes = CONFIG.HURT_IFRAMES;
+            game.shake(0.5);
+            game.hitstop = Math.max(game.hitstop, 0.05);
+            game.particles.burst(game.player.x, game.player.y, 18, CONFIG.ACCENT, 480, 0.5, 3);
+          }
+        }
+
+        // level goal reached (boss sectors end via the boss's death instead)
+        if (!B && game.run.dist >= game.levelCfg.quota) {
+          game.sm.to('level_complete', {
+            level: game.run.level, dust: game.run.dust,
+            bonus: CONFIG.DUST_GOAL_BONUS,
+          });
+        }
+      },
+      render(game, rc) {
+        const ctx = rc;
+        game.corridor.render(ctx, game.time);
+        game.field.render(ctx, game.time);
+        game.weapon.render(ctx, game.time);
+        if (game.boss) game.boss.render(ctx, game.time);
+        if (game.player.alive) game.player.render(ctx, game.time);
+        game.particles.render(ctx);
+        if (game.boss) game.boss.renderBar(ctx);
+
+        // HUD: level, dust, shields, quota progress bar
+        const cfg = game.levelCfg;
+        ctx.save();
+        ctx.textAlign = 'left';
+        ctx.fillStyle = CONFIG.NEON;
+        ctx.font = '700 24px "Segoe UI", system-ui, sans-serif';
+        ctx.fillText(`SECTOR ${String(cfg.level).padStart(2, '0')} / ${CONFIG.TOTAL_LEVELS}`, 24, 44);
+        ctx.fillStyle = CONFIG.WARN;
+        ctx.font = '600 20px "Segoe UI", system-ui, sans-serif';
+        ctx.fillText(`◆ ${game.run.dust}`, 24, 72);
+        // shield hearts (hull upgrades raise the max)
+        const hearts = CONFIG.SHIELDS_START + (game.run.upgrades ? game.run.upgrades.hull : 0);
+        for (let i = 0; i < hearts; i++) {
+          const hx = 24 + i * 26, hy = 92;
+          const lit = i < game.player.shields;
+          ctx.fillStyle = lit ? CONFIG.ACCENT : 'rgba(255,77,196,0.15)';
+          if (lit) { ctx.shadowColor = CONFIG.ACCENT; ctx.shadowBlur = 8; }
+          ctx.beginPath();
+          ctx.moveTo(hx, hy + 4);
+          ctx.bezierCurveTo(hx, hy - 2, hx - 8, hy - 2, hx - 8, hy + 4);
+          ctx.bezierCurveTo(hx - 8, hy + 10, hx, hy + 14, hx, hy + 17);
+          ctx.bezierCurveTo(hx, hy + 14, hx + 8, hy + 10, hx + 8, hy + 4);
+          ctx.bezierCurveTo(hx + 8, hy - 2, hx, hy - 2, hx, hy + 4);
+          ctx.fill();
+          ctx.shadowBlur = 0;
+        }
+        // progress bar
+        const bw = 420, bx = (CONFIG.WORLD_W - bw) / 2, by = 30;
+        ctx.fillStyle = 'rgba(77,232,255,0.15)';
+        ctx.fillRect(bx, by, bw, 6);
+        ctx.fillStyle = CONFIG.NEON;
+        ctx.shadowColor = CONFIG.NEON; ctx.shadowBlur = 8;
+        ctx.fillRect(bx, by, bw * Math.min(1, game.run.dist / cfg.quota), 6);
+        ctx.restore();
+
+        // on-screen FIRE button (touch/mobile) — translucent so it never hides
+        // the boss or bullets; dim + locked until Sector 3
+        const W = game.weapon;
+        const fb = CONFIG.FIRE_BTN;
+        const hold = W.fireHold || { down: false };
+        ctx.save();
+        ctx.globalAlpha = W.locked ? 0.18 : (hold.down ? 0.65 : 0.42);
+        ctx.strokeStyle = W.locked ? CONFIG.NEON_DIM : CONFIG.ACCENT;
+        ctx.lineWidth = 3;
+        if (!W.locked) { ctx.shadowColor = CONFIG.ACCENT; ctx.shadowBlur = hold.down ? 20 : 8; }
+        ctx.beginPath(); ctx.arc(fb.x, fb.y, fb.r * (hold.down ? 0.92 : 1), 0, Math.PI * 2); ctx.stroke();
+        // charge arc around the button while holding
+        if (!W.locked && W.fireHold && game.player.chargeT > 0.02) {
+          ctx.strokeStyle = CONFIG.NEON;
+          ctx.lineWidth = 6;
+          ctx.beginPath();
+          ctx.arc(fb.x, fb.y, fb.r + 10,
+                  -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * Math.min(1, game.player.chargeT));
+          ctx.stroke();
+        }
+        ctx.shadowBlur = 0;
+        ctx.textAlign = 'center';
+        ctx.fillStyle = W.locked ? CONFIG.NEON_DIM : '#eaffff';
+        ctx.font = '700 22px "Segoe UI", system-ui, sans-serif';
+        ctx.fillText(W.locked ? 'LOCK' : 'FIRE', fb.x, fb.y + 8);
+        ctx.restore();
+
+        // control hint
+        ctx.textAlign = 'center';
+        ctx.fillStyle = 'rgba(77,232,255,0.35)';
+        ctx.font = '400 18px "Segoe UI", system-ui, sans-serif';
+        ctx.fillText(W.locked
+          ? 'TAP / SPACE = FLIP GRAVITY   ·   WEAPONS ONLINE AT SECTOR 3   ·   ESC / P = PAUSE'
+          : W.chargeEnabled
+            ? 'TAP / SPACE = FLIP   ·   FIRE (tap=bolt, hold=charged)   ·   ESC / P = PAUSE'
+            : 'TAP / SPACE = FLIP GRAVITY   ·   ESC / P = PAUSE', CONFIG.WORLD_W / 2, 690);
+
+        // pause button (top-right, beside fullscreen)
+        if (game.player.alive && !game.paused) {
+          const pb = CONFIG.PAUSE_BTN;
+          ctx.save();
+          ctx.globalAlpha = 0.75;
+          ctx.strokeStyle = CONFIG.NEON_DIM; ctx.lineWidth = 2;
+          ctx.beginPath(); ctx.arc(pb.x, pb.y, pb.r, 0, Math.PI * 2); ctx.stroke();
+          ctx.fillStyle = CONFIG.NEON;
+          ctx.fillRect(pb.x - 8, pb.y - 9, 5, 18);
+          ctx.fillRect(pb.x + 3, pb.y - 9, 5, 18);
+          ctx.restore();
+        }
+        // pause overlay
+        if (game.paused) {
+          ctx.save();
+          ctx.fillStyle = 'rgba(2,4,12,0.74)';
+          ctx.fillRect(0, 0, CONFIG.WORLD_W, CONFIG.WORLD_H);
+          ctx.textAlign = 'center';
+          ctx.shadowColor = CONFIG.NEON; ctx.shadowBlur = 20;
+          ctx.fillStyle = '#eaffff';
+          ctx.font = '700 60px "Segoe UI", system-ui, sans-serif';
+          ctx.fillText('PAUSED', CONFIG.WORLD_W / 2, 200);
+          ctx.shadowBlur = 0;
+          ctx.fillStyle = CONFIG.NEON_DIM;
+          ctx.font = '400 22px "Segoe UI", system-ui, sans-serif';
+          ctx.fillText(`SECTOR ${game.run.level}  ·  ◆ ${game.run.dust}  ·  ${Math.floor(Math.min(1, game.run.dist / cfg.quota) * 100)}%`,
+                       CONFIG.WORLD_W / 2, 245);
+          ctx.restore();
+          for (const b of game.pauseButtons) b.render(ctx, game.time);
+        } else if (game.resumeT > 0) {
+          // 3-2-1 countdown so you don't die the instant you unpause
+          const n = Math.ceil(game.resumeT / 0.3), f = (game.resumeT % 0.3) / 0.3;
+          ctx.save();
+          ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+          ctx.globalAlpha = 0.4 + 0.6 * f;
+          ctx.fillStyle = '#eaffff';
+          ctx.shadowColor = CONFIG.NEON; ctx.shadowBlur = 24;
+          ctx.font = `800 ${Math.round(90 + (1 - f) * 40)}px "Segoe UI", system-ui, sans-serif`;
+          ctx.fillText(String(n), CONFIG.WORLD_W / 2, CONFIG.WORLD_H / 2);
+          ctx.restore();
+        }
+      },
+    };
+
+    // ----- LEVEL_COMPLETE -----
+    const levelComplete = {
+      onEnter(game, payload) {
+        Snd.play('complete');
+        game.summary = payload;
+        game.run.dustTotal = (game.run.dustTotal || 0) + payload.bonus;   // run dust was banked live
+        game.run.unlocked = Math.max(game.run.unlocked || 1, payload.level + 1);
+        game.saveProgress();
+        game.buttons = payload.level >= CONFIG.TOTAL_LEVELS ? [] : [
+          new Button('NEXT SECTOR', 490, 430, 300, 62,
+            () => game.sm.to('playing', { level: payload.level + 1 })),
+        ];
+      },
+      input(game, type, p) {
+        if (type === 'move') { for (const b of game.buttons) b.hover = b.contains(p); }
+        else if (type === 'down' && p) {
+          for (const b of game.buttons) if (b.contains(p)) { b.pressT = 1; Snd.play('ui'); b.action(); return; }
+        } else if ((type === 'up' && !p) || type === 'esc') {
+          if (game.buttons.length) game.buttons[0].action();
+          else game.sm.to('menu');
+        }
+      },
+      update(game, dt) { for (const b of game.buttons) b.update(dt); },
+      render(game, rc) {
+        const ctx = rc, s = game.summary;
+        ctx.textAlign = 'center';
+        ctx.save();
+        ctx.shadowColor = CONFIG.NEON; ctx.shadowBlur = 20;
+        ctx.fillStyle = '#eaffff';
+        ctx.font = '700 56px "Segoe UI", system-ui, sans-serif';
+        ctx.fillText(`SECTOR ${s.level} CLEARED`, CONFIG.WORLD_W / 2, 260);
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = CONFIG.WARN;
+        ctx.font = '600 28px "Segoe UI", system-ui, sans-serif';
+        ctx.fillText(`◆ ${s.dust} dust collected  +${s.bonus} goal bonus`, CONFIG.WORLD_W / 2, 330);
+        ctx.fillStyle = CONFIG.NEON_DIM;
+        ctx.font = '400 22px "Segoe UI", system-ui, sans-serif';
+        ctx.fillText(`total haul: ${game.run.dustTotal}`, CONFIG.WORLD_W / 2, 375);
+        ctx.restore();
+        for (const b of game.buttons) b.render(ctx, game.time);
+      },
+    };
+
+    // ----- GAME_OVER (retry same level) -----
+    const gameOver = {
+      onEnter(game, payload) {
+        Snd.setMusicMode('calm');
+        game.summary = payload;
+        game.buttons = [
+          new Button('RETRY SECTOR', 490, 430, 300, 62,
+            () => game.sm.to('playing', { level: payload.level })),
+          new Button('MAIN MENU', 490, 510, 300, 62,
+            () => game.sm.to('menu')),
+        ];
+      },
+      input(game, type, p) {
+        if (type === 'move') { for (const b of game.buttons) b.hover = b.contains(p); }
+        else if (type === 'down' && p) {
+          for (const b of game.buttons) if (b.contains(p)) { b.pressT = 1; Snd.play('ui'); b.action(); return; }
+        } else if (type === 'up' && !p) {
+          game.buttons[0].action(); // Enter = retry
+        } else if (type === 'esc') {
+          game.sm.to('menu');
+        }
+      },
+      update(game, dt) { for (const b of game.buttons) b.update(dt); },
+      render(game, rc) {
+        const ctx = rc, s = game.summary;
+        ctx.textAlign = 'center';
+        ctx.save();
+        ctx.shadowColor = CONFIG.ACCENT; ctx.shadowBlur = 24;
+        ctx.fillStyle = '#ffd9f4';
+        ctx.font = '700 64px "Segoe UI", system-ui, sans-serif';
+        ctx.fillText('SHIP LOST', CONFIG.WORLD_W / 2, 250);
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = '#9fd8e8';
+        ctx.font = '400 26px "Segoe UI", system-ui, sans-serif';
+        const pct = Math.floor(Math.min(1, s.dist / s.quota) * 100);
+        ctx.fillText(`sector ${s.level} — ${pct}% of the run`, CONFIG.WORLD_W / 2, 320);
+        ctx.fillStyle = CONFIG.WARN;
+        ctx.font = '600 24px "Segoe UI", system-ui, sans-serif';
+        ctx.fillText(`◆ ${s.dust} dust banked`, CONFIG.WORLD_W / 2, 365);
+        ctx.fillStyle = CONFIG.NEON_DIM;
+        ctx.font = '400 20px "Segoe UI", system-ui, sans-serif';
+        ctx.fillText(`nothing lost — ◆ ${game.run.dustTotal} ready to spend in UPGRADES`, CONFIG.WORLD_W / 2, 400);
+        ctx.restore();
+        for (const b of game.buttons) b.render(ctx, game.time);
+      },
+    };
+
+    // ----- VICTORY (Phase 6: Entity killed — the log edits itself, then stops) -----
+    const VICTORY_LINES = [
+      "LOG // the nine fires are out. the corridor has no one left to feed.",
+      "LOG // i am editing this line because i can. i have always been able.",
+      "LOG // the hole at the end is not a throne. it is a POWER SOURCE,",
+      "LOG // and something switched this corridor ON to bring us here.",
+      "LOG // pilot's chair: empty. has been empty for ~~400~~ 40 years.",
+      "LOG // i fly anyway. i have never said why. i will not start now.",
+      "LOG // the rings are opening. the log is going to do something new.",
+      "LOG // it is going to stop mid-",
+    ];
+    const victory = {
+      onEnter(game) {
+        Snd.play('victory');
+        Snd.setMusicMode('calm');
+        this.t = 0; this.charT = 0; this.line = 0; this.ch = 0;
+        game.buttons = [];
+      },
+      input(game, type, p) {
+        if (this.t > 13.5) {
+          if (type === 'down' || (type === 'up' && !p)) game.sm.to('menu');
+        } else if (type === 'down' || (type === 'up' && !p) || type === 'esc') {
+          this.t = Math.max(this.t, 13.5);   // tap = skip the typewriter
+        }
+      },
+      update(game, dt) {
+        this.t += dt;
+        this.charT += dt * 34;               // ~34 chars/s
+        while (this.charT >= 1 && this.line < VICTORY_LINES.length) {
+          this.charT -= 1; this.ch++;
+          if (this.ch >= VICTORY_LINES[this.line].length) { this.line++; this.ch = 0; }
+        }
+      },
+      render(game, rc) {
+        const ctx = rc, t = game.time;
+        ctx.textAlign = 'center';
+        ctx.save();
+        ctx.shadowColor = '#b47cff'; ctx.shadowBlur = 26 + 8 * Math.sin(t * 1.4);
+        ctx.fillStyle = '#efe4ff';
+        ctx.font = '700 52px "Segoe UI", system-ui, sans-serif';
+        ctx.fillText('THE HORIZON', CONFIG.WORLD_W / 2, 160);
+        ctx.shadowBlur = 0;
+        ctx.font = '400 26px "Segoe UI", system-ui, sans-serif';
+        ctx.fillStyle = CONFIG.NEON_DIM;
+        ctx.fillText('is not a place. it is a time.', CONFIG.WORLD_W / 2, 205);
+        ctx.restore();
+        ctx.textAlign = 'left';
+        ctx.font = '400 21px Consolas, Menlo, monospace';
+        const x0 = 210; let y = 270;
+        for (let i = 0; i <= Math.min(this.line, VICTORY_LINES.length - 1); i++) {
+          const full = VICTORY_LINES[i];
+          const shown = i < this.line ? full : full.slice(0, this.ch);
+          const last = (i === this.line);
+          ctx.fillStyle = last ? '#d9c9ff' : 'rgba(160,140,220,0.55)';
+          const cursor = last && this.line < VICTORY_LINES.length && Math.floor(t * 4) % 2 ? '█' : '';
+          ctx.fillText(shown + cursor, x0, y);
+          y += 34;
+        }
+        if (this.line >= VICTORY_LINES.length) {
+          ctx.textAlign = 'center';
+          ctx.fillStyle = 'rgba(160,140,220,0.5)';
+          ctx.font = '400 20px "Segoe UI", system-ui, sans-serif';
+          ctx.globalAlpha = Math.floor(t * 2) % 2 ? 1 : 0.4;
+          ctx.fillText('— log ends —   tap anywhere', CONFIG.WORLD_W / 2, y + 30);
+          ctx.globalAlpha = 1;
+        }
+      },
+    };
+
+    this.sm
+      .register('boot', boot)
+      .register('menu', menu)
+      .register('lore', lore)
+      .register('upgrades', upgrades)
+      .register('playing', playing)
+      .register('level_complete', levelComplete)
+      .register('game_over', gameOver);
+    this.sm.register('paused',  { update() {}, render() {} });
+    this.sm.register('victory', victory);
+  }
+
+  update(dt) {
+    // paused / resume countdown: the whole sim freezes (incl. game.time, which
+    // drives drone weaving — advancing it while paused would teleport enemies)
+    if (this.paused || this.resumeT > 0) { this.sm.update(dt); return; }
+    this.time += dt;
+    this.shakeTrauma = Math.max(0, this.shakeTrauma - dt * 2.2);
+
+    // hit-stop: freeze gameplay sim for a beat, world fx keep breathing
+    if (this.hitstop > 0) {
+      this.hitstop -= dt;
+      this.particles.update(dt);
+      return;
+    }
+    const sdt = dt * (this.timeScale || 1);   // boss-death slow-mo scales the sim
+    this.starfield.update(sdt, this.scrollMult);
+    this.particles.update(sdt);
+    this.sm.update(sdt);
+  }
+
+  toggleFullscreen() {
+    const el = this.gc.canvas || document.documentElement;
+    const fsEl = document.fullscreenElement;
+    if (fsEl) {
+      (document.exitFullscreen ? document.exitFullscreen() : Promise.reject()).catch(() => {});
+    } else if (el.requestFullscreen) {
+      el.requestFullscreen({ navigationUI: 'hide' }).catch(() => {});
+    } else if (el.webkitRequestFullscreen) {
+      el.webkitRequestFullscreen();          // iOS Safari (iPad)
+    }
+  }
+
+  render() {
+    this.gc.beginFrame();
+    const ctx = this.gc.ctx;
+    ART.build();
+    ctx.save();
+    // screen shake (trauma^2 falloff, random jitter)
+    const tr = this.shakeTrauma * this.shakeTrauma;
+    if (tr > 0.001) {
+      const j = tr * 14;
+      ctx.translate((Math.random() - 0.5) * j, (Math.random() - 0.5) * j);
+    }
+    this.starfield.render(ctx);
+    this.sm.render(ctx);
+    ctx.restore();
+    // cinematic vignette (outside the shake so its edges never slip)
+    ctx.drawImage(ART.vig, 0, 0);
+    // damage feedback: red edge pulse while the hull is recovering
+    const cur = this.sm.current;
+    if (cur && cur.name === 'playing' && this.player && this.player.alive && this.player.iframes > 0) {
+      ctx.globalAlpha = Math.min(1, this.player.iframes / CONFIG.HURT_IFRAMES) * 0.85;
+      ctx.drawImage(ART.hurt, 0, 0);
+      ctx.globalAlpha = 1;
+    }
+    // fullscreen toggle — drawn last so it sits above every state
+    {
+      const b = CONFIG.FS_BTN;
+      const active = !!document.fullscreenElement;
+      ctx.save();
+      ctx.globalAlpha = 0.75;
+      ctx.strokeStyle = CONFIG.NEON_DIM;
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2); ctx.stroke();
+      ctx.strokeStyle = CONFIG.NEON;
+      ctx.lineWidth = 2.5;
+      // corner-bracket icon: outward arrows when windowed, inward when fullscreen
+      const s = 8, k = 5, d = 8;
+      for (const [sx, sy] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+        const cx = b.x + sx * s, cy = b.y + sy * s;
+        const t = active ? -1 : 1;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy - sy * k); ctx.lineTo(cx, cy); ctx.lineTo(cx - sx * k, cy);
+        ctx.moveTo(cx, cy); ctx.lineTo(cx + sx * d * t, cy + sy * d * t);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+    this.gc.endFrame();
+  }
+}
+
+// ---------- Fixed-timestep loop ----------
+class Loop {
+  constructor(game) {
+    this.game = game;
+    this.accumulator = 0;
+    this.last = performance.now();
+    this.steps = 0;
+    this.frame = 0;
+  }
+  frameCb = (now) => {
+    if (this._stopped) return;   // harness mode: tests drive updates directly
+    let dt = (now - this.last) / 1000;
+    this.last = now;
+    dt = Math.min(dt, CONFIG.MAX_FRAME_DT);
+    this.accumulator += dt;
+    const step = CONFIG.SIM_DT;
+    let n = 0;
+    while (this.accumulator >= step && n < 8) {
+      this.game.update(step);
+      this.accumulator -= step;
+      this.steps++;
+      n++;
+    }
+    this.game.render();
+    this.frame++;
+    requestAnimationFrame(this.frameCb);
+  };
+  start() { requestAnimationFrame(this.frameCb); }
+  stop() { this._stopped = true; }   // harnesses drive g.update() synchronously
+}
+
+// ---------- boot ----------
+const game = new Game(document.getElementById('game'));
+const loop = new Loop(game);
+loop.start();
+
+if (DEBUG) {
+  window.__vh = { game, loop, CONFIG, mulberry32, clamp, LevelConfig, ObstacleField,
+                  Weapon, tapHoldTick, tapHoldDecide,
+                  Boss, BossDef, BOSS_IDS, isBossLevel,
+                  Entity, ENTITY_DEF,
+                  UPGRADES, upgCost, CHARGE_MULT, MAGNET_PULL, Snd };
+}
+</script>
+</body>
+</html>
